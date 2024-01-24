@@ -29,7 +29,7 @@ APPS2 := kmesh-cmd
 APPS3 := mdacore
 APPS4 := kmesh-cni
 
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall clean build docker
 
 all:
 	$(QUIET) find $(ROOT_DIR)/mk -name "*.pc" | xargs sed -i "s#^prefix=.*#prefix=${ROOT_DIR}#g"
@@ -88,6 +88,50 @@ uninstall:
 	$(QUIET) rm -rf $(INSTALL_BIN)/$(APPS2)
 	$(call printlog, UNINSTALL, $(INSTALL_BIN)/$(APPS3))
 	$(QUIET) rm -rf $(INSTALL_BIN)/$(APPS3)
+
+build:
+	$(QUIET) BUILD_CONTAINER_ID=$$(docker run -itd --privileged=true -v /usr/src:/usr/src -v /usr/include/linux/bpf.h:/kmesh/config/linux-bpf.h -v /etc/cni/net.d:/etc/cni/net.d -v /opt/cni/bin:/opt/cni/bin -v /mnt:/mnt -v /sys/fs/bpf:/sys/fs/bpf -v /lib/modules:/lib/modules --name kmesh-build kmesh:docker) && \
+	docker exec $${BUILD_CONTAINER_ID} yum install -y kmod util-linux make golang clang llvm libboundscheck protobuf-c-devel bpftool libbpf libbpf-devel cmake && \
+	timeout 2m docker exec kmesh-build ./start_kmesh.sh -enable-kmesh -enable-ads=false; \
+	if [ $$? -eq 124 ]; then \
+		echo "The command timed out"; \
+	else \
+		echo "The command completed within the timeout period"; \
+	fi && \
+	mkdir buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libkmesh_api_v2_c.so buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libkmesh_deserial.so buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libboundscheck.so buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libbpf.so.0 buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libbpf.so.0.8.1 buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libprotobuf-c.so.1 buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/lib64/libprotobuf-c.so.1.0.0 buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/bin/kmesh-daemon buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/bin/kmesh-cmd buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/bin/kmesh-cniplugin buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/bin/mdacore buildresult &&\
+	docker cp $${BUILD_CONTAINER_ID}:/usr/share/oncn-mda/sock_ops.c.o buildresult && \
+	docker cp $${BUILD_CONTAINER_ID}:/usr/share/oncn-mda/sock_redirect.c.o buildresult
+
+docker:
+	make build
+	$(QUIET) PURE_CONTAINER_ID=$$(docker run -itd --privileged=true -v /usr/src:/usr/src -v /usr/include/linux/bpf.h:/kmesh/config/linux-bpf.h -v /etc/cni/net.d:/etc/cni/net.d -v /opt/cni/bin:/opt/cni/bin -v /mnt:/mnt -v /sys/fs/bpf:/sys/fs/bpf -v /lib/modules:/lib/modules --name kmesh-pure kmesh:docker) && \
+	docker cp buildresult/libkmesh_api_v2_c.so $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/libkmesh_deserial.so $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/libboundscheck.so $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/libbpf.so.0 $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/libbpf.so.0.8.1 $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/libprotobuf-c.so.1 $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/libprotobuf-c.so.1.0.0 $${PURE_CONTAINER_ID}:/usr/lib64 && \
+	docker cp buildresult/kmesh-daemon $${PURE_CONTAINER_ID}:/usr/bin && \
+	docker cp buildresult/kmesh-cniplugin $${PURE_CONTAINER_ID}:/usr/bin && \
+	docker cp buildresult/kmesh-cmd $${PURE_CONTAINER_ID}:/usr/bin && \
+	docker cp buildresult/mdacore $${PURE_CONTAINER_ID}:/usr/bin  && \
+	docker exec $${PURE_CONTAINER_ID} mkdir /usr/share/oncn-mda/  && \
+	docker cp buildresult/sock_ops.c.o $${PURE_CONTAINER_ID}:/usr/share/oncn-mda/ && \
+	docker cp buildresult/sock_redirect.c.o $${PURE_CONTAINER_ID}:/usr/share/oncn-mda/  && \
+	docker exec $${PURE_CONTAINER_ID} yum install -y kmod util-linux && \
+	docker commit $${PURE_CONTAINER_ID} kmesh:runimage
 
 clean:
 	$(call printlog, CLEAN, $(APPS1))
