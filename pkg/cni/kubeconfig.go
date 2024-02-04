@@ -29,7 +29,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-package cni_plg
+package cni
 
 import (
 	"fmt"
@@ -38,8 +38,9 @@ import (
 
 	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/clientcmd/api/latest"
-	"kmesh.net/kmesh/pkg/utils"
 	"sigs.k8s.io/yaml"
+
+	"kmesh.net/kmesh/pkg/utils"
 )
 
 const ServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
