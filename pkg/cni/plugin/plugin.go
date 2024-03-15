@@ -37,6 +37,8 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
+	netns "github.com/containernetworking/plugins/pkg/ns"
+	"kmesh.net/kmesh/pkg/controller/bypass"
 	"kmesh.net/kmesh/pkg/logger"
 	"kmesh.net/kmesh/pkg/utils"
 )
@@ -236,6 +238,19 @@ func CmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
+	enableSidecar, err := checkSidecar(client, pod)
+	if err != nil {
+		log.Errorf("failed to check enable sidecar information: %v", err)
+		return err
+	}
+
+	if err := addIptables(enableSidecar, podNamespace); err != nil {
+		log.Error("failed to add iptables for sidecar")
+		return err
+	}
+
+	bypass.StartPodEventWatcher(client, podName, podNamespace)
+
 	return types.PrintResult(preResult, cniConf.CNIVersion)
 }
 
@@ -245,4 +260,51 @@ func CmdCheck(args *skel.CmdArgs) (err error) {
 
 func CmdDelete(args *skel.CmdArgs) error {
 	return nil
+}
+
+func addIptables(iptFlag bool, ns string) error {
+	if !iptFlag {
+		log.Debugf("don't need inject iptables rule, skip")
+		return nil
+	}
+	iptArgs := [][]string{
+		{"-t", "nat", "-I", "PREROUTING", "-m", "bpf", "--object-pinned", "/sys/fs/bpf/bypass", "-j", "RETURN"},
+		{"-t", "nat", "-I", "OUTPUT", "-m", "bpf", "--object-pinned", "/sys/fs/bpf/bypass", "-j", "RETURN"},
+	}
+
+	execFunc := func(netns.NetNS) error {
+		log.Debugf("Running iptables rule in namespace:%s", ns)
+		for _, args := range iptArgs {
+			if err := utils.Execute("iptables", args); err != nil {
+				err = fmt.Errorf("failed to exec command: iptables %v\", err: %v", args, err)
+				log.Error(err)
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := netns.WithNetNSPath(ns, execFunc); err != nil {
+		err = fmt.Errorf("enter ns path: %v, run command failed: %v", ns, err)
+		return err
+	}
+	return nil
+}
+
+func checkSidecar(client kubernetes.Interface, pod *v1.Pod) (bool, error) {
+	namespace, err := client.CoreV1().Namespaces().Get(context.TODO(), pod.Namespace, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	injectLabel := namespace.Labels["istio-injection"]
+	if injectLabel == "enabled" {
+		return true, nil
+	}
+
+	if _, ok := pod.Annotations["sidecar.istio.io/inject"]; ok {
+		return true, nil
+	}
+
+	return false, nil
 }
