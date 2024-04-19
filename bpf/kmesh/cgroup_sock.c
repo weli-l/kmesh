@@ -141,11 +141,11 @@ SEC("cgroup/connect4")
 int cgroup_connect4_prog(struct bpf_sock_addr *ctx)
 {
 	if (conn_from_bypass_sim_add(ctx)) {
-		record_netns_cookie(ctx);
+		record_bypass_netns_cookie(ctx);
 		return CGROUP_SOCK_OK;
 	}
 	if (conn_from_bypass_sim_delete(ctx)) {
-		remove_netns_cookie(ctx);
+		remove_bypass_netns_cookie(ctx);
 		return CGROUP_SOCK_OK;
 	}
 	int ret = sock4_traffic_control(ctx);
