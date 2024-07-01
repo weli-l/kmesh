@@ -19,9 +19,8 @@ package kmeshmanage
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
-	"syscall"
+	"strings"
 	"time"
 
 	netns "github.com/containernetworking/plugins/pkg/ns"
@@ -35,6 +34,7 @@ import (
 	"kmesh.net/kmesh/pkg/constants"
 	ns "kmesh.net/kmesh/pkg/controller/netns"
 	"kmesh.net/kmesh/pkg/logger"
+	"kmesh.net/kmesh/pkg/nets"
 )
 
 var (
@@ -52,10 +52,6 @@ var (
 
 const (
 	DefaultInformerSyncPeriod  = 30 * time.Second
-	SpecialIpForKmesh          = "0.0.0.1"
-	EnableKmeshPort            = 929
-	DisableKmeshPort           = 930
-	LabelSelectorKmesh         = constants.DataPlaneModeLabel + "=" + constants.DataPlaneModeKmesh
 	KmeshRedirectionAnnotation = "kmesh.net/redirection"
 )
 
@@ -66,7 +62,6 @@ func NewKmeshManageController(client kubernetes.Interface) (*KmeshManageControll
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(client, DefaultInformerSyncPeriod,
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
 			options.FieldSelector = fmt.Sprintf("spec.nodeName=%s", nodeName)
-			options.LabelSelector = LabelSelectorKmesh
 		}))
 
 	podInformer := informerFactory.Core().V1().Pods().Informer()
@@ -79,9 +74,13 @@ func NewKmeshManageController(client kubernetes.Interface) (*KmeshManageControll
 				return
 			}
 
+			if !checkValid(pod) {
+				return
+			}
+
 			log.Infof("%s/%s: enable Kmesh manage", pod.GetNamespace(), pod.GetName())
 
-			nspath, _ := ns.GetNSpath(pod)
+			nspath, _ := ns.GetPodNSpath(pod)
 
 			if err := handleKmeshManage(nspath, true); err != nil {
 				log.Errorf("failed to enable Kmesh manage")
@@ -92,32 +91,32 @@ func NewKmeshManageController(client kubernetes.Interface) (*KmeshManageControll
 				return
 			}
 		},
-		DeleteFunc: func(obj interface{}) {
-			if _, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				return
-			}
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				log.Errorf("expected *corev1.Pod but got %T", obj)
-				return
-			}
-
-			if isPodBeingDeleted(pod) {
-				log.Debugf("%s/%s: Pod is being deleted, skipping further processing", pod.GetNamespace(), pod.GetName())
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod, okOld := oldObj.(*corev1.Pod)
+			newPod, okNew := newObj.(*corev1.Pod)
+			if !okOld || !okNew {
+				log.Errorf("expected *corev1.Pod but got %T and %T", oldObj, newObj)
 				return
 			}
 
-			log.Infof("%s/%s: disable Kmesh manage", pod.GetNamespace(), pod.GetName())
+			if checkValid(oldPod) && !checkValid(newPod) {
+				if isPodBeingDeleted(newPod) {
+					log.Debugf("%s/%s: Pod is being deleted, skipping further processing", newPod.GetNamespace(), newPod.GetName())
+					return
+				}
 
-			nspath, _ := ns.GetNSpath(pod)
-			if err := handleKmeshManage(nspath, false); err != nil {
-				log.Errorf("failed to disable Kmesh manage")
-				return
-			}
+				log.Infof("%s/%s: disable Kmesh manage", newPod.GetNamespace(), newPod.GetName())
 
-			if err := delKmeshAnnotation(client, pod); err != nil {
-				log.Errorf("failed to delete Kmesh annotation, err is %v", err)
-				return
+				nspath, _ := ns.GetPodNSpath(newPod)
+				if err := handleKmeshManage(nspath, false); err != nil {
+					log.Errorf("failed to disable Kmesh manage")
+					return
+				}
+
+				if err := delKmeshAnnotation(client, newPod); err != nil {
+					log.Errorf("failed to delete Kmesh annotation, err is %v", err)
+					return
+				}
 			}
 		},
 	}); err != nil {
@@ -151,6 +150,11 @@ func isPodBeingDeleted(pod *corev1.Pod) bool {
 	return pod.ObjectMeta.DeletionTimestamp != nil
 }
 
+func checkValid(pod *corev1.Pod) bool {
+	mode := pod.Labels[constants.DataPlaneModeLabel]
+	return strings.EqualFold(mode, constants.DataPlaneModeKmesh)
+}
+
 func addKmeshAnnotation(client kubernetes.Interface, pod *corev1.Pod) error {
 	_, err := client.CoreV1().Pods(pod.Namespace).Patch(
 		context.Background(),
@@ -175,30 +179,11 @@ func delKmeshAnnotation(client kubernetes.Interface, pod *corev1.Pod) error {
 
 func handleKmeshManage(ns string, op bool) error {
 	execFunc := func(netns.NetNS) error {
-		simip := net.ParseIP(SpecialIpForKmesh)
-		port := EnableKmeshPort
+		port := constants.OperEnableControl
 		if !op {
-			port = DisableKmeshPort
+			port = constants.OperDisableControl
 		}
-		sockfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-		if err != nil {
-			return err
-		}
-		if err = syscall.SetNonblock(sockfd, true); err != nil {
-			return err
-		}
-		err = syscall.Connect(sockfd, &syscall.SockaddrInet4{
-			Port: port,
-			Addr: [4]byte(simip.To4()),
-		})
-		if err == nil {
-			return err
-		}
-		errno, ok := err.(syscall.Errno)
-		if ok && errno == syscall.EINPROGRESS {
-			return nil
-		}
-		return err
+		return nets.TriggerControlCommand(port)
 	}
 
 	if err := netns.WithNetNSPath(ns, execFunc); err != nil {
