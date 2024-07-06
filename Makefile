@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Author: LemmyHuang
-# Create: 2021-12-08
 VERSION ?= 1.0-dev
 GIT_COMMIT_HASH ?= $(shell git rev-parse HEAD)
 GIT_TREESTATE=$(shell if [ -n "$(git status --porcelain)" ]; then echo "dirty"; else echo "clean"; fi)
 BUILD_DATE = $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
 ROOT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 	GOBIN=$(shell go env GOPATH)/bin
@@ -71,7 +70,8 @@ TMP_FILES := bpf/kmesh/bpf2go/bpf2go.go \
 	config/kmesh_marcos_def.h \
 	mk/api-v2-c.pc \
 	mk/bpf.pc \
-	bpf/kmesh/ads/include/config.h
+	bpf/kmesh/ads/include/config.h \
+	bpf/include/bpf_helper_defs_ext.h
 
 .PHONY: all install uninstall clean build docker
 
@@ -142,14 +142,30 @@ uninstall:
 	$(call printlog, UNINSTALL, $(INSTALL_BIN)/$(APPS3))
 	$(QUIET) rm -rf $(INSTALL_BIN)/$(APPS3)
 
+.PHONY: build
 build:
 	./kmesh_compile.sh
 	
 docker: build
 	docker build --build-arg arch=$(DIR) -f build/docker/kmesh.dockerfile -t $(HUB)/$(TARGET):$(TAG) .
 
+docker.push: docker
+	docker push $(HUB)/$(TARGET):$(TAG)
+
+e2e:
+	./test/e2e/run_test.sh
+
 format:
 	./hack/format.sh
+
+.PHONY: test
+ifeq ($(RUN_IN_CONTAINER),1)
+test:
+	./hack/run-ut.sh --docker
+else
+test:
+	./hack/run-ut.sh --local
+endif
 
 clean:
 	$(QUIET) rm -rf ./out

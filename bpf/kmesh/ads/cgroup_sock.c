@@ -1,21 +1,5 @@
-/*
- * Copyright 2023 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
-
- * Author: nlgwcy
- * Create: 2022-02-14
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright Authors of Kmesh */
 
 #include <linux/in.h>
 #include <linux/bpf.h>
@@ -52,7 +36,7 @@ static inline int sock4_traffic_control(struct bpf_sock_addr *ctx)
             return -ENOENT;
     }
     DECLARE_VAR_IPV4(ctx->user_ip4, ip);
-    BPF_LOG(DEBUG, KMESH, "bpf find listener addr=[%pI4h:%u]\n", &ip, bpf_ntohs(ctx->user_port));
+    BPF_LOG(DEBUG, KMESH, "bpf find listener addr=[%s:%u]\n", ip2str(&ip, 1), bpf_ntohs(ctx->user_port));
 
 #if ENHANCED_KERNEL
     // todo build when kernel support http parse and route
@@ -74,10 +58,16 @@ static inline int sock4_traffic_control(struct bpf_sock_addr *ctx)
 SEC("cgroup/connect4")
 int cgroup_connect4_prog(struct bpf_sock_addr *ctx)
 {
-    if (handle_kmesh_manage_process(ctx) || !is_kmesh_enabled(ctx)) {
+    struct kmesh_context kmesh_ctx = {0};
+    kmesh_ctx.ctx = ctx;
+    kmesh_ctx.orig_dst_addr.ip4 = ctx->user_ip4;
+    kmesh_ctx.dnat_ip.ip4 = ctx->user_ip4;
+    kmesh_ctx.dnat_port = ctx->user_port;
+
+    if (handle_kmesh_manage_process(&kmesh_ctx) || !is_kmesh_enabled(ctx)) {
         return CGROUP_SOCK_OK;
     }
-    if (handle_bypass_process(ctx) || is_bypass_enabled(ctx)) {
+    if (handle_bypass_process(&kmesh_ctx) || is_bypass_enabled(ctx)) {
         return CGROUP_SOCK_OK;
     }
     int ret = sock4_traffic_control(ctx);
@@ -87,5 +77,5 @@ int cgroup_connect4_prog(struct bpf_sock_addr *ctx)
 #endif // KMESH_ENABLE_TCP
 #endif // KMESH_ENABLE_IPV4
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual BSD/GPL";
 int _version SEC("version") = 1;

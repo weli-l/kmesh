@@ -1,21 +1,6 @@
-/*
- * Copyright 2023 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Kmesh */
 
- * Author: nlgwcy
- * Create: 2022-02-14
- */
 #ifndef __KMESH_FILTER_H__
 #define __KMESH_FILTER_H__
 
@@ -199,7 +184,7 @@ int filter_chain_manager(ctx_buff_t *ctx)
     /* filter match */
     ret = filter_chain_filter_match(filter_chain, &addr, ctx, &filter, &filter_idx);
     if (ret != 0) {
-        BPF_LOG(ERR, FILTERCHAIN, "no match filter, addr=%pI4h\n", &addr.ipv4);
+        BPF_LOG(ERR, FILTERCHAIN, "no match filter, addr=%s\n", ip2str(&addr.ipv4, 1));
         return KMESH_TAIL_CALL_RET(-1);
     }
 

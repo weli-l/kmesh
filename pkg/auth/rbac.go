@@ -22,26 +22,29 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
+	"unsafe"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 
 	"kmesh.net/kmesh/api/v2/workloadapi"
 	"kmesh.net/kmesh/api/v2/workloadapi/security"
-	"kmesh.net/kmesh/pkg/bpf"
 	"kmesh.net/kmesh/pkg/controller/workload/cache"
 	"kmesh.net/kmesh/pkg/logger"
-	"kmesh.net/kmesh/pkg/nets"
 )
 
 const (
 	SPIFFE_PREFIX = "spiffe://"
-	MSG_TYPE_IPV4 = 0
-	MSG_TYPE_IPV6 = 1
+	MSG_TYPE_IPV4 = uint32(0)
+	MSG_TYPE_IPV6 = uint32(1)
 	// IPV4_TUPLE_LENGTH is the fixed length of IPv4 source/destination address(4 bytes each) and port(2 bytes each)
-	IPV4_TUPLE_LENGTH = 12
+	IPV4_TUPLE_LENGTH = int(unsafe.Sizeof(bpfSockTupleV4{}))
+	// TUPLE_LEN is the fixed length of 4-tuple(source/dest IP/port) in a record from map of tuple
+	TUPLE_LEN = int(unsafe.Sizeof(bpfSockTupleV6{}))
 	// MSG_LEN is the fixed length of one record we retrieve from map of tuple
-	MSG_LEN = 40
+	MSG_LEN = TUPLE_LEN + int(unsafe.Sizeof(MSG_TYPE_IPV4))
 )
 
 var (
@@ -49,8 +52,9 @@ var (
 )
 
 type Rbac struct {
-	policyStore *policyStore
-	bpfWorkload *bpf.BpfKmeshWorkload
+	policyStore   *policyStore
+	workloadCache cache.WorkloadCache
+	notifyFunc    notifyFunc
 }
 
 type Identity struct {
@@ -62,35 +66,55 @@ type Identity struct {
 type rbacConnection struct {
 	srcIdentity Identity
 	dstNetwork  string
-	srcIp       []byte
-	dstIp       []byte
-	dstPort     uint32
+	// srcIp is big endian
+	srcIp []byte
+	// dstIp ip is big endian
+	dstIp []byte
+	// dstPort is little endian
+	dstPort uint32
 }
 
-func NewRbac(workloadObj *bpf.BpfKmeshWorkload) *Rbac {
+type bpfSockTupleV4 struct {
+	// All fields are big endian
+	SrcAddr uint32
+	DstAddr uint32
+	SrcPort uint16
+	DstPort uint16
+}
+
+type bpfSockTupleV6 struct {
+	// All fields are big endian
+	SrcAddr [4]uint32
+	DstAddr [4]uint32
+	SrcPort uint16
+	DstPort uint16
+}
+
+func NewRbac(workloadCache cache.WorkloadCache) *Rbac {
 	return &Rbac{
-		policyStore: newPolicystore(),
-		bpfWorkload: workloadObj,
+		policyStore:   newPolicyStore(),
+		workloadCache: workloadCache,
+		notifyFunc:    xdpNotifyConnRst,
 	}
 }
 
-func (r *Rbac) Run(ctx context.Context) {
-	if r == nil {
+func (r *Rbac) Run(ctx context.Context, mapOfTuple, mapOfAuth *ebpf.Map) {
+	if r == nil || mapOfTuple == nil {
+		log.Error("r or mapOfTuple is nil")
 		return
 	}
-	reader, err := ringbuf.NewReader(r.bpfWorkload.SockOps.MapOfTuple)
+	reader, err := ringbuf.NewReader(mapOfTuple)
 	if err != nil {
-		log.Errorf("open ringbuf map FAILED, err: %v", err)
+		log.Error("open ringbuf map FAILED, err: ", err)
 		return
 	}
 	defer func() {
 		if err := reader.Close(); err != nil {
-			log.Errorf("reader Close FAILED, err: %v", err)
+			log.Error("reader Close FAILED, err: ", err)
 		}
 	}()
 
 	rec := ringbuf.Record{}
-	tupleV4, tupleV6 := bpfSockTupleV4{}, bpfSockTupleV6{}
 	var conn rbacConnection
 	for {
 		select {
@@ -98,51 +122,35 @@ func (r *Rbac) Run(ctx context.Context) {
 			return
 		default:
 			if err = reader.ReadInto(&rec); err != nil {
-				log.Errorf("ringbuf reader FAILED to read, err: %v", err)
+				log.Error("ringbuf reader FAILED to read, err: ", err)
 				continue
 			}
-
 			if len(rec.RawSample) != MSG_LEN {
-				log.Errorf("wrong length %v of a msg...", len(rec.RawSample))
+				log.Errorf("wrong length %v of a msg, should be %v", len(rec.RawSample), MSG_LEN)
 				continue
 			}
+			// RawSample is network order
 			msgType := binary.LittleEndian.Uint32(rec.RawSample)
-			var buf *bytes.Buffer
+			tupleData := rec.RawSample[unsafe.Sizeof(msgType):]
+			buf := bytes.NewBuffer(tupleData)
 			switch msgType {
 			case MSG_TYPE_IPV4:
-				buf = bytes.NewBuffer(rec.RawSample[4 : IPV4_TUPLE_LENGTH+4+1])
-				if err = binary.Read(buf, binary.LittleEndian, &tupleV4); err != nil {
-					log.Errorf("deserialize IPv4 FAILED, err: %v", err)
-					continue
-				}
-				conn = buildConnV4(&tupleV4)
+				conn, err = r.buildConnV4(buf)
 			case MSG_TYPE_IPV6:
-				buf = bytes.NewBuffer(rec.RawSample[4:])
-				if err = binary.Read(buf, binary.LittleEndian, &tupleV6); err != nil {
-					log.Errorf("deserialize IPv6 FAILED, err: %v", err)
-					continue
-				}
-				conn = buildConnV6(&tupleV6)
+				conn, err = r.buildConnV6(buf)
 			default:
-				log.Errorf("INVALID msg type: %v", msgType)
+				log.Error("invalid msg type: ", msgType)
+				continue
+			}
+			if err != nil {
 				continue
 			}
 
 			if !r.doRbac(&conn) {
-				switch msgType {
-				case MSG_TYPE_IPV4:
-					if err = xdpNotifyConnRstV4(&xdpHandlerKeyV4{Tuple: tupleV4}); err != nil {
-						log.Errorf("XdpHandlerUpdateV4 FAILED, err: %v", err)
-						continue
-					}
-				case MSG_TYPE_IPV6:
-					if err = xdpNotifyConnRstV6(&xdpHandlerKeyV6{tuple: tupleV6}); err != nil {
-						log.Errorf("XdpHandlerUpdateV6 FAILED, err: %v", err)
-						continue
-					}
-				default:
-					log.Errorf("INVALID msg type: %v", msgType)
-					continue
+				log.Infof("Auth denied for connection: %+v", conn)
+				// If conn is denied, write tuples into XDP map, which includes source/destination IP/Port
+				if err = r.notifyFunc(mapOfAuth, msgType, tupleData); err != nil {
+					log.Error("authmap update FAILED, err: ", err)
 				}
 			}
 		}
@@ -157,15 +165,25 @@ func (r *Rbac) RemovePolicy(policyKey string) {
 	r.policyStore.removePolicy(policyKey)
 }
 
+// GetAllPolicies returns all policy names in the policy store
+func (r *Rbac) GetAllPolicies() map[string]string {
+	if r == nil {
+		return nil
+	}
+	return r.policyStore.getAllPolicies()
+}
+
 func (r *Rbac) doRbac(conn *rbacConnection) bool {
-	var dstWorkload *workloadapi.Workload
-	if len(conn.dstIp) > 0 {
-		dstWorkload = cache.WorkloadCache.GetWorkloadByAddr(cache.NetworkAddress{
-			Network: conn.dstNetwork,
-			Address: nets.ConvertIpByteToUint32(conn.dstIp),
-		})
+	var networkAddress cache.NetworkAddress
+	networkAddress.Network = conn.dstNetwork
+	networkAddress.Address, _ = netip.AddrFromSlice(conn.dstIp)
+	dstWorkload := r.workloadCache.GetWorkloadByAddr(networkAddress)
+	// If no workload found, deny
+	if dstWorkload == nil {
+		return false
 	}
 
+	// TODO: maybe cache them for performance issue
 	allowPolicies, denyPolicies := r.aggregate(dstWorkload)
 
 	// 1. If there is ANY deny policy, deny the request
@@ -191,17 +209,14 @@ func (r *Rbac) doRbac(conn *rbacConnection) bool {
 	return false
 }
 
-func (r *Rbac) aggregate(workload *workloadapi.Workload) (allowPolicies, denyPolicies []authPolicy) {
-	allowPolicies = make([]authPolicy, 0)
-	denyPolicies = make([]authPolicy, 0)
+func (r *Rbac) aggregate(workload *workloadapi.Workload) (allowPolicies, denyPolicies []*security.Authorization) {
+	allowPolicies = make([]*security.Authorization, 0)
+	denyPolicies = make([]*security.Authorization, 0)
 
-	// Collect policy names from workload, global namespace and namespace
-	policyNames := r.policyStore.getByNamesapce("").UnsortedList()
-	if workload != nil {
-		policyNames = append(append(policyNames,
-			r.policyStore.getByNamesapce(workload.Namespace).UnsortedList()...),
-			workload.GetAuthorizationPolicies()...)
-	}
+	// Collect policy names from workload,  namespace and global(root namespace)
+	policyNames := workload.GetAuthorizationPolicies()
+	policyNames = append(policyNames, r.policyStore.getByNamespace(workload.Namespace)...)
+	policyNames = append(policyNames, r.policyStore.getByNamespace("")...)
 
 	for _, policyName := range policyNames {
 		if policy, ok := r.policyStore.byKey[policyName]; ok {
@@ -215,7 +230,7 @@ func (r *Rbac) aggregate(workload *workloadapi.Workload) (allowPolicies, denyPol
 	return
 }
 
-func matches(conn *rbacConnection, policy authPolicy) bool {
+func matches(conn *rbacConnection, policy *security.Authorization) bool {
 	if policy.GetRules() == nil {
 		return false
 	}
@@ -432,22 +447,41 @@ func internalMatchNamespace(srcNs string, namespaces []*security.StringMatch) bo
 	return false
 }
 
-func buildConnV4(tupleV4 *bpfSockTupleV4) rbacConnection {
-	conn := rbacConnection{}
-	conn.srcIp = binary.LittleEndian.AppendUint32(conn.srcIp, tupleV4.SrcAddr)
-	conn.dstIp = binary.LittleEndian.AppendUint32(conn.dstIp, tupleV4.DstAddr)
-	conn.dstPort = uint32(tupleV4.DstPort<<8 | tupleV4.DstPort>>8)
-	return conn
+func (r *Rbac) buildConnV4(buf *bytes.Buffer) (rbacConnection, error) {
+	var (
+		conn    rbacConnection
+		tupleV4 bpfSockTupleV4
+	)
+	if err := binary.Read(buf, binary.BigEndian, &tupleV4); err != nil {
+		log.Error("deserialize IPv4 FAILED, err: ", err)
+		return conn, err
+	}
+	// srcIp and dstIp are big endian, and dstPort is little endian, which is consistent with authorization policy flushed to Kmesh
+	conn.srcIp = binary.BigEndian.AppendUint32(conn.srcIp, tupleV4.SrcAddr)
+	conn.dstIp = binary.BigEndian.AppendUint32(conn.dstIp, tupleV4.DstAddr)
+	conn.dstPort = uint32(tupleV4.DstPort)
+	conn.srcIdentity = r.getIdentityByIp(conn.srcIp)
+	return conn, nil
 }
 
-func buildConnV6(tupleV6 *bpfSockTupleV6) rbacConnection {
-	conn := rbacConnection{}
-	for i := range tupleV6.SrcAddr {
-		conn.srcIp = binary.LittleEndian.AppendUint32(conn.srcIp, tupleV6.SrcAddr[4-i])
-		conn.dstIp = binary.LittleEndian.AppendUint32(conn.dstIp, tupleV6.DstAddr[4-i])
+func (r *Rbac) buildConnV6(buf *bytes.Buffer) (rbacConnection, error) {
+	var (
+		conn    rbacConnection
+		tupleV6 bpfSockTupleV6
+	)
+
+	if err := binary.Read(buf, binary.BigEndian, &tupleV6); err != nil {
+		log.Error("deserialize IPv6 FAILED, err: ", err)
+		return conn, err
 	}
-	conn.dstPort = uint32(tupleV6.DstPort<<8 | tupleV6.DstPort>>8)
-	return conn
+	// srcIp and dstIp are big endian, and dstPort is little endian, which is consistent with authorization policy flushed to Kmesh
+	for i := range tupleV6.SrcAddr {
+		conn.srcIp = binary.BigEndian.AppendUint32(conn.srcIp, tupleV6.SrcAddr[i])
+		conn.dstIp = binary.BigEndian.AppendUint32(conn.dstIp, tupleV6.DstAddr[i])
+	}
+	conn.dstPort = uint32(tupleV6.DstPort)
+	conn.srcIdentity = r.getIdentityByIp(conn.srcIp)
+	return conn, nil
 }
 
 func (id *Identity) String() string {
@@ -460,4 +494,20 @@ func isEmptyMatch(m *security.Match) bool {
 		m.GetDestinationPorts() == nil && m.GetNotDestinationPorts() == nil &&
 		m.GetPrincipals() == nil && m.GetNotPrincipals() == nil &&
 		m.GetNamespaces() == nil && m.GetNotNamespaces() == nil
+}
+
+// todo : get identity form tls connection
+func (r *Rbac) getIdentityByIp(ip []byte) Identity {
+	var networkAddress cache.NetworkAddress
+	networkAddress.Address, _ = netip.AddrFromSlice(ip)
+	workload := r.workloadCache.GetWorkloadByAddr(networkAddress)
+	if workload == nil {
+		log.Warnf("get worload from ip %v FAILED", ip)
+		return Identity{}
+	}
+	return Identity{
+		trustDomain:    workload.GetTrustDomain(),
+		namespace:      workload.GetNamespace(),
+		serviceAccount: workload.GetServiceAccount(),
+	}
 }

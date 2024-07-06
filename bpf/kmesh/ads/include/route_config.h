@@ -1,21 +1,6 @@
-/*
- * Copyright 2023 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Kmesh */
 
- * Author: nlgwcy
- * Create: 2022-02-26
- */
 #ifndef __ROUTE_CONFIG_H__
 #define __ROUTE_CONFIG_H__
 
@@ -377,13 +362,13 @@ int route_config_manager(ctx_buff_t *ctx)
 
     virt_host = virtual_host_match(route_config, &addr, ctx);
     if (!virt_host) {
-        BPF_LOG(ERR, ROUTER_CONFIG, "failed to match virtual host, addr=%pI4h\n", &addr.ipv4);
+        BPF_LOG(ERR, ROUTER_CONFIG, "failed to match virtual host, addr=%s\n", ip2str(&addr.ipv4, 1));
         return KMESH_TAIL_CALL_RET(-1);
     }
 
     route = virtual_host_route_match(virt_host, &addr, ctx, (struct bpf_mem_ptr *)ctx_val->msg);
     if (!route) {
-        BPF_LOG(ERR, ROUTER_CONFIG, "failed to match route action, addr=%pI4h\n", &addr.ipv4);
+        BPF_LOG(ERR, ROUTER_CONFIG, "failed to match route action, addr=%s\n", ip2str(&addr.ipv4, 1));
         return KMESH_TAIL_CALL_RET(-1);
     }
 

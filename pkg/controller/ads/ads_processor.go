@@ -32,7 +32,6 @@ import (
 
 	admin_v2 "kmesh.net/kmesh/api/v2/admin"
 	core_v2 "kmesh.net/kmesh/api/v2/core"
-
 	"kmesh.net/kmesh/pkg/constants"
 	"kmesh.net/kmesh/pkg/controller/config"
 	"kmesh.net/kmesh/pkg/utils/hash"
@@ -52,8 +51,9 @@ type processor struct {
 	Cache     *AdsCache
 	ack       *service_discovery_v3.DiscoveryRequest
 	req       *service_discovery_v3.DiscoveryRequest
-	adminChan chan *admin_v2.ConfigResources
-	LastNonce *lastNonce
+	lastNonce *lastNonce
+	// the channel used to send domains to dns resolver. key is domain name and value is refreshrate
+	DnsResolverChan chan []*config_cluster_v3.Cluster
 }
 
 func newProcessor() *processor {
@@ -61,16 +61,7 @@ func newProcessor() *processor {
 		Cache:     NewAdsCache(),
 		ack:       nil,
 		req:       nil,
-		LastNonce: NewLastNonce(),
-	}
-}
-
-func NewLastNonce() *lastNonce {
-	return &lastNonce{
-		cdsNonce: "",
-		edsNonce: "",
-		ldsNonce: "",
-		rdsNonce: "",
+		lastNonce: &lastNonce{},
 	}
 }
 
@@ -104,25 +95,25 @@ func newAckRequest(resp *service_discovery_v3.DiscoveryResponse) *service_discov
 // * RDS updates related to the newly added listeners must arrive after CDS/EDS/LDS updates.
 // * VHDS updates (if any) related to the newly added RouteConfigurations must arrive after RDS updates.
 // * Stale CDS clusters and related EDS endpoints (ones no longer being referenced) can then be removed.
-func (svc *processor) processAdsResponse(resp *service_discovery_v3.DiscoveryResponse) {
+func (p *processor) processAdsResponse(resp *service_discovery_v3.DiscoveryResponse) {
 	var err error
 
 	log.Debugf("handle ads response, %#v\n", resp.GetTypeUrl())
 
-	svc.ack = newAckRequest(resp)
+	p.ack = newAckRequest(resp)
 	if resp.GetResources() == nil {
 		return
 	}
 
 	switch resp.GetTypeUrl() {
 	case resource_v3.ClusterType:
-		err = svc.handleCdsResponse(resp)
+		err = p.handleCdsResponse(resp)
 	case resource_v3.EndpointType:
-		err = svc.handleEdsResponse(resp)
+		err = p.handleEdsResponse(resp)
 	case resource_v3.ListenerType:
-		err = svc.handleLdsResponse(resp)
+		err = p.handleLdsResponse(resp)
 	case resource_v3.RouteType:
-		err = svc.handleRdsResponse(resp)
+		err = p.handleRdsResponse(resp)
 	default:
 		err = fmt.Errorf("unsupport type url %s", resp.GetTypeUrl())
 	}
@@ -132,167 +123,210 @@ func (svc *processor) processAdsResponse(resp *service_discovery_v3.DiscoveryRes
 	}
 }
 
-func (svc *processor) handleCdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
-	var (
-		err     error
-		cluster = &config_cluster_v3.Cluster{}
-	)
-
-	svc.LastNonce.cdsNonce = resp.Nonce
+func (p *processor) handleCdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
+	p.lastNonce.cdsNonce = resp.Nonce
 	current := sets.New[string]()
-	lastEdsClusterNames := svc.Cache.edsClusterNames
-	svc.Cache.edsClusterNames = []string{}
+	lastEdsClusterNames := p.Cache.edsClusterNames
+	p.Cache.edsClusterNames = nil
+	dnsClusters := []*config_cluster_v3.Cluster{}
 	for _, resource := range resp.GetResources() {
-		if err = anypb.UnmarshalTo(resource, cluster, proto.UnmarshalOptions{}); err != nil {
+		cluster := &config_cluster_v3.Cluster{}
+		if err := anypb.UnmarshalTo(resource, cluster, proto.UnmarshalOptions{}); err != nil {
+			log.Errorf("unmarshal cluster error: %v", err)
 			continue
 		}
 		current.Insert(cluster.GetName())
+
 		if cluster.GetType() == config_cluster_v3.Cluster_EDS {
-			svc.Cache.edsClusterNames = append(svc.Cache.edsClusterNames, cluster.GetName())
+			p.Cache.edsClusterNames = append(p.Cache.edsClusterNames, cluster.GetName())
+		} else if cluster.GetType() == config_cluster_v3.Cluster_STRICT_DNS ||
+			cluster.GetType() == config_cluster_v3.Cluster_LOGICAL_DNS {
+			dnsClusters = append(dnsClusters, cluster)
 		}
 		// compare part[0] CDS now
 		// Cluster_EDS need compare tow parts, compare part[1] EDS in EDS handler
-		apiStatus := core_v2.ApiStatus_UPDATE
 		newHash := hash.Sum64String(resource.String())
-		if newHash != svc.Cache.ClusterCache.GetCdsHash(cluster.GetName()) {
-			svc.Cache.ClusterCache.SetCdsHash(cluster.GetName(), newHash)
+		if newHash != p.Cache.ClusterCache.GetCdsHash(cluster.GetName()) {
+			var status core_v2.ApiStatus
+			if cluster.GetType() == config_cluster_v3.Cluster_EDS {
+				status = core_v2.ApiStatus_WAITING
+			} else if cluster.GetType() == config_cluster_v3.Cluster_STRICT_DNS ||
+				cluster.GetType() == config_cluster_v3.Cluster_LOGICAL_DNS {
+				// dns typed cluster will be handled in dns module, skip update bpf map here
+				status = core_v2.ApiStatus_WAITING
+			} else {
+				status = core_v2.ApiStatus_UPDATE
+			}
+
 			log.Debugf("[CreateApiClusterByCds] update cluster %s, status %d, cluster.type %v",
-				cluster.GetName(), apiStatus, cluster.GetType())
-			svc.Cache.CreateApiClusterByCds(apiStatus, cluster)
+				cluster.GetName(), status, cluster.GetType())
+			p.Cache.ClusterCache.SetCdsHash(cluster.GetName(), newHash)
+			p.Cache.CreateApiClusterByCds(status, cluster)
 		} else {
 			log.Debugf("unchanged cluster %s", cluster.GetName())
 		}
 	}
 
-	removed := svc.Cache.ClusterCache.GetResourceNames().Difference(current)
+	if len(dnsClusters) > 0 {
+		// send dns clusters to dns resolver
+		p.DnsResolverChan <- dnsClusters
+	}
+	removed := p.Cache.ClusterCache.GetResourceNames().Difference(current)
 	for key := range removed {
-		svc.Cache.UpdateApiClusterStatus(key, core_v2.ApiStatus_DELETE)
+		p.Cache.UpdateApiClusterStatus(key, core_v2.ApiStatus_DELETE)
+	}
+	if len(removed) > 0 {
+		log.Debugf("removed cluster: %v", removed.UnsortedList())
 	}
 
-	// TODO: maybe we don't need to wait until all clusters ready before loading, like cluster delete
+	// Flush the clusters in these cases:
+	// 1. clusters need to be deleted
+	// 2. dns typed clusters update, we donot need to wait for eds update, because dns cluster has no eds following
+	// Note eds typed cluster, we donot flush to bpf map here, we need to wait for eds update.
+	p.Cache.ClusterCache.Flush()
+
+	if p.lastNonce.edsNonce == "" {
+		// initial subscribe to eds
+		p.req = newAdsRequest(resource_v3.EndpointType, p.Cache.edsClusterNames, "")
+		return nil
+	}
 
 	// when the list of eds typed clusters subscribed changed, we should resubscrbe to new eds.
-	if !slices.EqualUnordered(svc.Cache.edsClusterNames, lastEdsClusterNames) {
-		svc.req = newAdsRequest(resource_v3.EndpointType, svc.Cache.edsClusterNames, svc.LastNonce.edsNonce)
-	} else {
-		svc.Cache.ClusterCache.Flush()
+	if !slices.EqualUnordered(p.Cache.edsClusterNames, lastEdsClusterNames) {
+		// we cannot set the nonce here.
+		// There is a race: when xds server has pushed eds, but kmesh hasn't a chance to receive and process
+		// Then it will lead to this request been ignored, we will lose the new eds resource
+		p.req = newAdsRequest(resource_v3.EndpointType, p.Cache.edsClusterNames, "")
 	}
+
 	return nil
 }
 
-func (svc *processor) handleEdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
-	var (
-		err            error
-		loadAssignment = &config_endpoint_v3.ClusterLoadAssignment{}
-	)
-
-	svc.LastNonce.edsNonce = resp.Nonce
+func (p *processor) handleEdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
+	var loadAssignment = &config_endpoint_v3.ClusterLoadAssignment{}
+	p.lastNonce.edsNonce = resp.Nonce
 	for _, resource := range resp.GetResources() {
-		if err = anypb.UnmarshalTo(resource, loadAssignment, proto.UnmarshalOptions{}); err != nil {
+		if err := anypb.UnmarshalTo(resource, loadAssignment, proto.UnmarshalOptions{}); err != nil {
 			continue
 		}
-		cluster := svc.Cache.ClusterCache.GetApiCluster(loadAssignment.GetClusterName())
+		cluster := p.Cache.ClusterCache.GetApiCluster(loadAssignment.GetClusterName())
 		// fix exceptional scenarios: receive eds push after cds has been deleted
 		if cluster == nil {
+			log.Debugf("cluster %s is deleted", loadAssignment.GetClusterName())
 			continue
 		}
 		apiStatus := cluster.ApiStatus
 		newHash := hash.Sum64String(resource.String())
 		// part[0] CDS is different or part[1] EDS is different
-		if apiStatus == core_v2.ApiStatus_UPDATE ||
-			newHash != svc.Cache.ClusterCache.GetEdsHash(loadAssignment.GetClusterName()) {
+		if apiStatus == core_v2.ApiStatus_WAITING ||
+			newHash != p.Cache.ClusterCache.GetEdsHash(loadAssignment.GetClusterName()) {
 			apiStatus = core_v2.ApiStatus_UPDATE
-			svc.Cache.ClusterCache.SetEdsHash(loadAssignment.GetClusterName(), newHash)
+			p.Cache.ClusterCache.SetEdsHash(loadAssignment.GetClusterName(), newHash)
 			log.Debugf("[CreateApiClusterByEds] update cluster %s", loadAssignment.GetClusterName())
-			svc.Cache.CreateApiClusterByEds(apiStatus, loadAssignment)
+			p.Cache.CreateApiClusterByEds(apiStatus, loadAssignment)
+		} else {
+			log.Debugf("handleEdsResponse: unchanged cluster %s", loadAssignment.GetClusterName())
 		}
-		svc.ack.ResourceNames = append(svc.ack.ResourceNames, loadAssignment.GetClusterName())
 	}
 
-	svc.req = newAdsRequest(resource_v3.ListenerType, nil, svc.LastNonce.ldsNonce)
-	svc.Cache.ClusterCache.Flush()
+	// EDS ack should contain all the eds cluster names, and since istiod can send partial eds to us, we use those set by handleCdsResponse
+	// Ad xds protocol spec, the non wildcard resource ack should contain all the names
+	p.ack.ResourceNames = p.Cache.edsClusterNames
+
+	if p.lastNonce.ldsNonce == "" {
+		// subscribe to lds only once per stream
+		p.req = newAdsRequest(resource_v3.ListenerType, nil, "")
+	}
+
+	p.Cache.ClusterCache.Flush()
+
 	return nil
 }
 
-func (svc *processor) handleLdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
+func (p *processor) handleLdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
 	var (
 		err      error
 		listener = &config_listener_v3.Listener{}
 	)
 
-	svc.LastNonce.ldsNonce = resp.Nonce
+	p.lastNonce.ldsNonce = resp.Nonce
 	current := sets.New[string]()
-	lastRouteNames := svc.Cache.routeNames
-	svc.Cache.routeNames = []string{}
+	lastRouteNames := p.Cache.routeNames
+	p.Cache.routeNames = []string{}
 	for _, resource := range resp.GetResources() {
 		if err = anypb.UnmarshalTo(resource, listener, proto.UnmarshalOptions{}); err != nil {
+			continue
+		}
+		if listener.GetAddress() == nil {
+			// skip the listener without address
 			continue
 		}
 		current.Insert(listener.GetName())
 		apiStatus := core_v2.ApiStatus_UPDATE
 		newHash := hash.Sum64String(resource.String())
-		if newHash != svc.Cache.ListenerCache.GetLdsHash(listener.GetName()) {
-			svc.Cache.ListenerCache.AddOrUpdateLdsHash(listener.GetName(), newHash)
+		if newHash != p.Cache.ListenerCache.GetLdsHash(listener.GetName()) {
+			p.Cache.ListenerCache.AddOrUpdateLdsHash(listener.GetName(), newHash)
 			log.Debugf("[CreateApiListenerByLds] update %s", listener.GetName())
 		} else {
 			log.Debugf("[CreateApiListenerByLds] unchanged %s", listener.GetName())
 			apiStatus = core_v2.ApiStatus_UNCHANGED
 		}
-		svc.Cache.CreateApiListenerByLds(apiStatus, listener)
+		p.Cache.CreateApiListenerByLds(apiStatus, listener)
 	}
 
-	removed := svc.Cache.ListenerCache.GetResourceNames().Difference(current)
+	removed := p.Cache.ListenerCache.GetResourceNames().Difference(current)
 	for key := range removed {
-		svc.Cache.UpdateApiListenerStatus(key, core_v2.ApiStatus_DELETE)
+		p.Cache.UpdateApiListenerStatus(key, core_v2.ApiStatus_DELETE)
 	}
 
-	svc.Cache.ListenerCache.Flush()
+	p.Cache.ListenerCache.Flush()
 
-	if !slices.EqualUnordered(svc.Cache.routeNames, lastRouteNames) {
-		svc.req = newAdsRequest(resource_v3.RouteType, svc.Cache.routeNames, svc.LastNonce.rdsNonce)
+	if !slices.EqualUnordered(p.Cache.routeNames, lastRouteNames) {
+		// we cannot set the nonce here.
+		// There is a race: when xds server has pushed rds, but kmesh hasn't a chance to receive and process
+		// Then it will lead to this request been ignored, we will lose the new rds resource
+		p.req = newAdsRequest(resource_v3.RouteType, p.Cache.routeNames, "")
 	}
 	return nil
 }
 
-func (svc *processor) handleRdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
-	var (
-		err                error
-		routeConfiguration = &config_route_v3.RouteConfiguration{}
-	)
+func (p *processor) handleRdsResponse(resp *service_discovery_v3.DiscoveryResponse) error {
+	routeConfiguration := &config_route_v3.RouteConfiguration{}
 
-	svc.LastNonce.rdsNonce = resp.Nonce
+	p.lastNonce.rdsNonce = resp.Nonce
 	current := sets.New[string]()
 	for _, resource := range resp.GetResources() {
-		if err = anypb.UnmarshalTo(resource, routeConfiguration, proto.UnmarshalOptions{}); err != nil {
+		if err := anypb.UnmarshalTo(resource, routeConfiguration, proto.UnmarshalOptions{}); err != nil {
 			continue
 		}
 		current.Insert(routeConfiguration.GetName())
 		newHash := hash.Sum64String(resource.String())
-		if newHash != svc.Cache.RouteCache.GetRdsHash(routeConfiguration.GetName()) {
-			svc.Cache.RouteCache.SetRdsHash(routeConfiguration.GetName(), newHash)
+		if newHash != p.Cache.RouteCache.GetRdsHash(routeConfiguration.GetName()) {
+			p.Cache.RouteCache.SetRdsHash(routeConfiguration.GetName(), newHash)
 			log.Debugf("[CreateApiRouteByRds] update %s", routeConfiguration.GetName())
-			svc.Cache.CreateApiRouteByRds(core_v2.ApiStatus_UPDATE, routeConfiguration)
+			p.Cache.CreateApiRouteByRds(core_v2.ApiStatus_UPDATE, routeConfiguration)
 		} else {
 			log.Debugf("[CreateApiRouteByRds] unchanged %s", routeConfiguration.GetName())
 		}
 		// if rds has no virtualhost, no need to subscribe this rds again in response
 		if routeConfiguration.GetVirtualHosts() != nil {
-			svc.ack.ResourceNames = append(svc.ack.ResourceNames, routeConfiguration.GetName())
+			p.ack.ResourceNames = append(p.ack.ResourceNames, routeConfiguration.GetName())
 		}
 	}
-	removed := svc.Cache.RouteCache.GetResourceNames().Difference(current)
-	for key := range removed {
-		svc.Cache.RouteCache.UpdateApiRouteStatus(key, core_v2.ApiStatus_DELETE)
-	}
 
-	svc.req = nil
-	svc.Cache.RouteCache.Flush()
+	removed := p.Cache.RouteCache.GetResourceNames().Difference(current)
+	for key := range removed {
+		p.Cache.RouteCache.UpdateApiRouteStatus(key, core_v2.ApiStatus_DELETE)
+	}
+	p.Cache.RouteCache.Flush()
 	return nil
 }
 
-// TODO(hzxuzhonghu): remove it as not used at all
-func (svc *processor) NewAdminRequest(resources *admin_v2.ConfigResources) {
-	svc.adminChan <- resources
+func (p *processor) Reset() {
+	if p == nil {
+		return
+	}
+	p.lastNonce = &lastNonce{}
 }
 
 func ConfigResourcesIsEmpty(resources *admin_v2.ConfigResources) bool {

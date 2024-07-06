@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/structpb"
 	pb "istio.io/api/security/v1alpha1"
 	"istio.io/istio/pkg/security"
@@ -49,7 +50,7 @@ type tlsOptions struct {
 // NewCaClient create a CA client for CSR sign.
 // The following function is adapted from istio NewCitadelClient
 // (https://github.com/istio/istio/blob/master/security/pkg/nodeagent/caclient/providers/citadel/client.go)
-func newCaClient(opts *security.Options, tlsOpts *tlsOptions) (*caClient, error) {
+func newCaClient(opts *security.Options, tlsOpts *tlsOptions) (CaClient, error) {
 	var err error
 
 	c := &caClient{
@@ -57,7 +58,7 @@ func newCaClient(opts *security.Options, tlsOpts *tlsOptions) (*caClient, error)
 		opts:    opts,
 	}
 
-	conn, err := nets.GrpcConnect(CSRSignAddress)
+	conn, err := nets.GrpcConnect(caAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create grpcconnect : %v", err)
 	}
@@ -67,10 +68,10 @@ func newCaClient(opts *security.Options, tlsOpts *tlsOptions) (*caClient, error)
 	return c, nil
 }
 
-// csrSend send a grpc request to istio and sign a CSR.
+// CsrSend send a grpc request to istio and sign a CSR.
 // The following function is adapted from istio CSRSign
 // (https://github.com/istio/istio/blob/master/security/pkg/nodeagent/caclient/providers/citadel/client.go)
-func (c *caClient) csrSend(csrPEM []byte, certValidsec int64, identity string) ([]string, error) {
+func (c caClient) CsrSend(csrPEM []byte, certValidsec int64, identity string) ([]string, error) {
 	crMeta := &structpb.Struct{
 		Fields: map[string]*structpb.Value{
 			security.ImpersonatedIdentity: {
@@ -84,20 +85,13 @@ func (c *caClient) csrSend(csrPEM []byte, certValidsec int64, identity string) (
 		Metadata:         crMeta,
 	}
 
-	ctx := context.Background()
-
+	// TODO: support customize clusterID, which is needed for multicluster mesh
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("ClusterID", "Kubernetes"))
 	// To handle potential grpc connection disconnection and retry once
 	// when certificate acquisition fails. If it still fails, return an error.
 	resp, err := c.client.CreateCertificate(ctx, req)
 	if err != nil {
-		log.Errorf("create certificate: %v reconnect...", err)
-		if err := c.reconnect(); err != nil {
-			return nil, fmt.Errorf("reconnect error: %v", err)
-		}
-		resp, err = c.client.CreateCertificate(ctx, req)
-		if err != nil {
-			return nil, fmt.Errorf("create certificate: %v", err)
-		}
+		return nil, fmt.Errorf("create certificate failed: %v", err)
 	}
 
 	if len(resp.CertChain) <= 1 {
@@ -121,7 +115,7 @@ func standardCerts(certsPEM []string) []byte {
 
 // The following function is adapted from istio generateNewSecret
 // (https://github.com/istio/istio/blob/master/security/pkg/nodeagent/cache/secretcache.go)
-func (c *caClient) fetchCert(identity string) (*security.SecretItem, error) {
+func (c *caClient) FetchCert(identity string) (*security.SecretItem, error) {
 	var rootCertPEM []byte
 
 	options := pkiutil.CertOptions{
@@ -138,9 +132,9 @@ func (c *caClient) fetchCert(identity string) (*security.SecretItem, error) {
 		log.Errorf("%s failed to generate key and certificate for CSR: %v", identity, err)
 		return nil, err
 	}
-	certChainPEM, err := c.csrSend(csrPEM, int64(c.opts.SecretTTL.Seconds()), identity)
+	certChainPEM, err := c.CsrSend(csrPEM, int64(c.opts.SecretTTL.Seconds()), identity)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get certChainPEM")
+		return nil, err
 	}
 
 	certChain := standardCerts(certChainPEM)
@@ -153,7 +147,7 @@ func (c *caClient) fetchCert(identity string) (*security.SecretItem, error) {
 
 	rootCertPEM = []byte(certChainPEM[len(certChainPEM)-1])
 
-	log.Debugf("cert for %v ExpireTime :%v", identity, expireTime)
+	log.Debugf("cert for %v expireTime :%v", identity, expireTime)
 	return &security.SecretItem{
 		CertificateChain: certChain,
 		PrivateKey:       keyPEM,
@@ -164,16 +158,6 @@ func (c *caClient) fetchCert(identity string) (*security.SecretItem, error) {
 	}, nil
 }
 
-func (c *caClient) reconnect() error {
-	if err := c.conn.Close(); err != nil {
-		return fmt.Errorf("failed to close connection: %v", err)
-	}
-
-	conn, err := nets.GrpcConnect(CSRSignAddress)
-	if err != nil {
-		return err
-	}
-	c.conn = conn
-	c.client = pb.NewIstioCertificateServiceClient(conn)
-	return nil
+func (c *caClient) Close() error {
+	return c.conn.Close()
 }

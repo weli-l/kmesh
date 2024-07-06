@@ -1,20 +1,8 @@
-/*
- * Copyright 2024 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright Authors of Kmesh */
 
 #include <linux/bpf.h>
+#include <sys/socket.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include "bpf_log.h"
@@ -43,14 +31,42 @@
 #define TLV_TYPE_SIZE   1
 #define TLV_LENGTH_SIZE 4
 
-#define TLV_DST_LENGTH 6
-#define TLV_DST_SIZE   11
-#define TLV_END_SIZE   5
+#define TLV_IP4_LENGTH  4
+#define TLV_IP6_LENGTH  16
+#define TLV_PORT_LENGTH 2
+
+/*
+[dst_ip4]   - 4 bytes
+[dst_port]  - 2 bytes
+*/
+#define TLV_ORG_DST_ADDR4_LENGTH (TLV_IP4_LENGTH + TLV_PORT_LENGTH)
+#define TLV_ORG_DST_ADDR6_LENGTH (TLV_IP6_LENGTH + TLV_PORT_LENGTH)
+
+/*
+[TYPE]      - TLV_TYPE_SIZE byte
+[length]    - TLV_LENGTH_SIZE bytes
+[dst_ip4]   - TLV_IP4_LENGTH bytes
+[dst_port]  - TLV_PORT_LENGTH bytes
+*/
+#define TLV_ORG_DST_ADDR4_SIZE (TLV_TYPE_SIZE + TLV_LENGTH_SIZE + TLV_ORG_DST_ADDR4_LENGTH)
+
+#define TLV_ORG_DST_ADDR6_SIZE (TLV_TYPE_SIZE + TLV_LENGTH_SIZE + TLV_ORG_DST_ADDR6_LENGTH)
+/*
+An empty TLV block indicates the end, e.g:
+[type=0xfe]
+[length = 0]
+*/
+#define TLV_END_SIZE (TLV_TYPE_SIZE + TLV_LENGTH_SIZE)
 
 #define FORMAT_IP_LENGTH 16
-
+/*
+tlv struct
+[TYPE]      - 1 byte, define tlv block type
+[length]    - 4 bytes, size of value
+[value]     - 'length' bytes, payload
+*/
 enum TLV_TYPE {
-    TLV_DST_INFO = 0x01,
+    TLV_ORG_DST_ADDR = 0x01,
     TLV_PAYLOAD = 0xfe,
 };
 
@@ -63,33 +79,7 @@ static inline int check_overflow(struct sk_msg_md *msg, __u8 *begin, __u32 lengt
     return 0;
 }
 
-static inline int _encode_tlv_type(struct sk_msg_md *msg, enum TLV_TYPE type, __u32 off)
-{
-    __u8 *begin = (__u8 *)(msg->data) + off;
-    if (check_overflow(msg, begin, 1))
-        return off;
-    *begin = (__u8)type;
-
-    return off + TLV_TYPE_SIZE; // cost 1 byte
-}
-
-static inline int _encode_tlv_length(struct sk_msg_md *msg, __u32 length, __u32 off)
-{
-    __u32 *begin = (__u32 *)((__u8 *)(msg->data) + off);
-    if (check_overflow(msg, (__u8 *)begin, 4))
-        return off;
-    *begin = bpf_htonl(length);
-    return off + TLV_LENGTH_SIZE; // cost 4 byte
-}
-
-static inline int encode_metadata_end(struct sk_msg_md *msg, __u32 off)
-{
-    off = _encode_tlv_type(msg, TLV_PAYLOAD, off);
-    off = _encode_tlv_length(msg, 0, off);
-    return off;
-}
-
-static inline int get_origin_dst(struct sk_msg_md *msg, __u32 *dst_ip, __u16 *dst_port)
+static inline int get_origin_dst(struct sk_msg_md *msg, struct ip_addr *dst_ip, __u16 *dst_port)
 {
     __u64 *current_sk = (__u64 *)msg->sk;
     struct bpf_sock_tuple *dst;
@@ -97,8 +87,15 @@ static inline int get_origin_dst(struct sk_msg_md *msg, __u32 *dst_ip, __u16 *ds
     dst = bpf_map_lookup_elem(&map_of_dst_info, &current_sk);
     if (!dst)
         return -ENOENT;
-    *dst_ip = dst->ipv4.daddr;
-    *dst_port = dst->ipv4.dport;
+
+    if (msg->family == AF_INET) {
+        dst_ip->ip4 = dst->ipv4.daddr;
+        *dst_port = dst->ipv4.dport;
+    } else {
+        bpf_memcpy(dst_ip->ip6, dst->ipv6.daddr, IPV6_ADDR_LEN);
+        *dst_port = dst->ipv6.dport;
+    }
+
     bpf_map_delete_elem(&map_of_dst_info, &current_sk);
     return 0;
 }
@@ -114,57 +111,73 @@ static inline int alloc_dst_length(struct sk_msg_md *msg, __u32 length)
     return 0;
 }
 
-static inline void encode_metadata_dst(struct sk_msg_md *msg, __u32 off)
+#define SK_MSG_WRITE_BUF(sk_msg, offset, payload, payloadlen)                                                          \
+    do {                                                                                                               \
+        __u8 *begin = (__u8 *)((sk_msg)->data) + *(offset);                                                            \
+        if (check_overflow((sk_msg), begin, payloadlen)) {                                                             \
+            BPF_LOG(ERR, SENDMSG, "sk msg write buf overflow, off: %u, len: %u\n", *(offset), payloadlen);             \
+            break;                                                                                                     \
+        }                                                                                                              \
+        bpf_memcpy(begin, payload, payloadlen);                                                                        \
+        *(offset) += (payloadlen);                                                                                     \
+    } while (0)
+
+static inline void encode_metadata_end(struct sk_msg_md *msg, __u32 *off)
 {
-    __u32 dst_ip;
+    __u8 type = TLV_PAYLOAD;
+    __u32 size = 0;
+
+    SK_MSG_WRITE_BUF(msg, off, &type, TLV_TYPE_SIZE);
+    SK_MSG_WRITE_BUF(msg, off, &size, TLV_LENGTH_SIZE);
+    return;
+}
+
+static inline void encode_metadata_org_dst_addr(struct sk_msg_md *msg, __u32 *off, bool v4)
+{
+    struct ip_addr dst_ip = {0};
     __u16 dst_port;
-    __u32 *msg_dst_ip_loc;
-    __u16 *msg_dst_port_loc;
+    __u8 type = TLV_ORG_DST_ADDR;
+    __u32 tlv_size = (v4 ? TLV_ORG_DST_ADDR4_SIZE : TLV_ORG_DST_ADDR6_SIZE);
+    __u32 addr_size = (v4 ? TLV_ORG_DST_ADDR4_LENGTH : TLV_ORG_DST_ADDR6_LENGTH);
 
     if (get_origin_dst(msg, &dst_ip, &dst_port))
         return;
 
-    if (alloc_dst_length(msg, TLV_DST_SIZE + TLV_END_SIZE))
+    if (alloc_dst_length(msg, tlv_size + TLV_END_SIZE))
         return;
 
     BPF_LOG(DEBUG, SENDMSG, "get valid dst, do encoding...\n");
 
-    off = _encode_tlv_type(msg, TLV_DST_INFO, off);
-    off = _encode_tlv_length(msg, TLV_DST_LENGTH, off);
+    // write T
+    SK_MSG_WRITE_BUF(msg, off, &type, TLV_TYPE_SIZE);
 
-    msg_dst_ip_loc = (__u32 *)((__u8 *)msg->data + off);
-    if (check_overflow(msg, (__u8 *)msg_dst_ip_loc, 4))
-        return;
-    *msg_dst_ip_loc = dst_ip;
-    off += 4;
+    // write L
+    addr_size = bpf_htonl(addr_size);
+    SK_MSG_WRITE_BUF(msg, off, &addr_size, TLV_LENGTH_SIZE);
 
-    msg_dst_port_loc = (__u16 *)((__u8 *)msg->data + off);
-    if (check_overflow(msg, (__u8 *)msg_dst_port_loc, 2))
-        return;
-    *msg_dst_port_loc = dst_port;
-    off += 2;
+    // write V
+    if (v4)
+        SK_MSG_WRITE_BUF(msg, off, (__u8 *)&dst_ip.ip4, TLV_IP4_LENGTH);
+    else
+        SK_MSG_WRITE_BUF(msg, off, (__u8 *)dst_ip.ip6, TLV_IP6_LENGTH);
+    SK_MSG_WRITE_BUF(msg, off, &dst_port, TLV_PORT_LENGTH);
 
+    // write END
     encode_metadata_end(msg, off);
-}
-
-static inline void encode_metadata(struct sk_msg_md *msg, enum TLV_TYPE type, __u32 off)
-{
-    switch (type) {
-    case TLV_DST_INFO: {
-        encode_metadata_dst(msg, off);
-        break;
-    }
-    default:
-        break;
-    }
+    return;
 }
 
 SEC("sk_msg")
-int sendmsg(struct sk_msg_md *msg)
+int sendmsg_prog(struct sk_msg_md *msg)
 {
-    encode_metadata(msg, TLV_DST_INFO, 0);
+    __u32 off = 0;
+    if (msg->family != AF_INET && msg->family != AF_INET6)
+        return SK_PASS;
+
+    // encode org dst addr
+    encode_metadata_org_dst_addr(msg, &off, (msg->family == AF_INET));
     return SK_PASS;
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual BSD/GPL";
 int _version SEC("version") = 1;

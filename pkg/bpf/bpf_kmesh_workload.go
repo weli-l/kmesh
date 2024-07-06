@@ -34,8 +34,10 @@ import (
 )
 
 type BpfSockConnWorkload struct {
-	Info BpfInfo
-	Link link.Link
+	Info  BpfInfo
+	Link  link.Link
+	Info6 BpfInfo
+	Link6 link.Link
 	bpf2go.KmeshCgroupSockWorkloadObjects
 }
 
@@ -44,6 +46,7 @@ func (sc *BpfSockConnWorkload) NewBpf(cfg *options.BpfConfig) error {
 	sc.Info.BpfFsPath = cfg.BpfFsPath + "/bpf_kmesh_workload/sockconn/"
 	sc.Info.BpfVerifyLogSize = cfg.BpfVerifyLogSize
 	sc.Info.Cgroup2Path = cfg.Cgroup2Path
+	sc.Info6 = sc.Info
 
 	if err := os.MkdirAll(sc.Info.MapPath,
 		syscall.S_IRUSR|syscall.S_IWUSR|syscall.S_IXUSR|
@@ -100,12 +103,22 @@ func (sc *BpfSockConnWorkload) LoadSockConn() error {
 	sc.Info.AttachType = prog.AttachType
 
 	if err = sc.MapOfTailCallProg.Update(
-		uint32(0),
+		uint32(constants.TailCallConnect4Index),
 		uint32(sc.CgroupConnect4Prog.FD()),
 		ebpf.UpdateAny); err != nil {
 		return err
 	}
 
+	prog = spec.Programs["cgroup_connect6_prog"]
+	sc.Info6.Type = prog.Type
+	sc.Info6.AttachType = prog.AttachType
+
+	if err = sc.MapOfTailCallProg.Update(
+		uint32(constants.TailCallConnect6Index),
+		uint32(sc.CgroupConnect6Prog.FD()),
+		ebpf.UpdateAny); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -117,19 +130,26 @@ func (sc *BpfSockConnWorkload) close() error {
 }
 
 func (sc *BpfSockConnWorkload) Attach() error {
+	var err error
 	cgopt := link.CgroupOptions{
 		Path:    sc.Info.Cgroup2Path,
 		Attach:  sc.Info.AttachType,
 		Program: sc.KmeshCgroupSockWorkloadObjects.CgroupConnect4Prog,
 	}
 
-	lk, err := link.AttachCgroup(cgopt)
+	sc.Link, err = link.AttachCgroup(cgopt)
 	if err != nil {
 		return err
 	}
-	sc.Link = lk
 
-	return nil
+	cgopt = link.CgroupOptions{
+		Path:    sc.Info6.Cgroup2Path,
+		Attach:  sc.Info6.AttachType,
+		Program: sc.KmeshCgroupSockWorkloadObjects.CgroupConnect6Prog,
+	}
+
+	sc.Link6, err = link.AttachCgroup(cgopt)
+	return err
 }
 
 func (sc *BpfSockConnWorkload) Detach() error {
@@ -154,6 +174,14 @@ func (sc *BpfSockConnWorkload) Detach() error {
 
 	if sc.Link != nil {
 		return sc.Link.Close()
+	}
+
+	if err := os.RemoveAll(sc.Info6.BpfFsPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	if sc.Link6 != nil {
+		return sc.Link6.Close()
 	}
 	return nil
 }
@@ -222,7 +250,7 @@ func (so *BpfSockOpsWorkload) LoadSockOps() error {
 		return err
 	}
 
-	prog := spec.Programs["record_tuple"]
+	prog := spec.Programs["sockops_prog"]
 	so.Info.Type = prog.Type
 	so.Info.AttachType = prog.AttachType
 
@@ -233,7 +261,7 @@ func (so *BpfSockOpsWorkload) Attach() error {
 	cgopt := link.CgroupOptions{
 		Path:    so.Info.Cgroup2Path,
 		Attach:  so.Info.AttachType,
-		Program: so.KmeshSockopsWorkloadObjects.RecordTuple,
+		Program: so.KmeshSockopsWorkloadObjects.SockopsProg,
 	}
 
 	lk, err := link.AttachCgroup(cgopt)
@@ -277,7 +305,7 @@ func (so *BpfSockOpsWorkload) Detach() error {
 }
 
 func (so *BpfSockOpsWorkload) GetSockMapFD() int {
-	return so.KmeshSockopsWorkloadObjects.KmeshSockopsWorkloadMaps.MapOfKmeshHashmap.FD()
+	return so.KmeshSockopsWorkloadObjects.KmeshSockopsWorkloadMaps.MapOfKmeshSocket.FD()
 }
 
 type BpfSendMsgWorkload struct {
@@ -341,7 +369,7 @@ func (sm *BpfSendMsgWorkload) LoadSendMsg() error {
 		return err
 	}
 
-	prog := spec.Programs["sendmsg"]
+	prog := spec.Programs["sendmsg_prog"]
 	sm.Info.Type = prog.Type
 	sm.Info.AttachType = prog.AttachType
 	return nil
@@ -349,7 +377,7 @@ func (sm *BpfSendMsgWorkload) LoadSendMsg() error {
 
 func (sm *BpfSendMsgWorkload) Attach() error {
 	// Use a program handle that cannot be closed by the caller
-	clone, err := sm.KmeshSendmsgObjects.KmeshSendmsgPrograms.Sendmsg.Clone()
+	clone, err := sm.KmeshSendmsgObjects.KmeshSendmsgPrograms.SendmsgProg.Clone()
 	if err != nil {
 		return err
 	}
@@ -372,7 +400,7 @@ func (sm *BpfSendMsgWorkload) Detach() error {
 	if sm.AttachFD > 0 {
 		args := link.RawDetachProgramOptions{
 			Target:  sm.AttachFD,
-			Program: sm.KmeshSendmsgObjects.KmeshSendmsgPrograms.Sendmsg,
+			Program: sm.KmeshSendmsgObjects.KmeshSendmsgPrograms.SendmsgProg,
 			Attach:  ebpf.AttachSkMsgVerdict,
 		}
 

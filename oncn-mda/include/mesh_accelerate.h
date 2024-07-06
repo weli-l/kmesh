@@ -1,20 +1,5 @@
-/*
- * Copyright 2023 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * Description: the file define the ebpf map
- */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Kmesh */
 
 #ifndef MESH_ACCELERATING_H
 #define MESH_ACCELERATING_H
@@ -36,6 +21,14 @@ enum bpf_loglevel {
 };
 
 #define BPF_LOGLEVEL BPF_LOG_ERROR
+
+#if OE_23_03
+#define GET_SKOPS_REMOTE_PORT(sk_ops) (__u16)((sk_ops)->remote_port)
+#else
+#define GET_SKOPS_REMOTE_PORT(sk_ops) (__u16)((sk_ops)->remote_port >> 16)
+#endif
+
+#define GET_SKOPS_LOCAL_PORT(sk_ops) (__u16)((sk_ops)->local_port)
 
 #ifndef bpf_printk
 #define bpf_printk(fmt, ...)                                                                                           \

@@ -17,43 +17,62 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 
+	"kmesh.net/kmesh/daemon/options"
 	"kmesh.net/kmesh/pkg/bpf"
 	"kmesh.net/kmesh/pkg/constants"
 	"kmesh.net/kmesh/pkg/controller/bypass"
+	manage "kmesh.net/kmesh/pkg/controller/manage"
 	"kmesh.net/kmesh/pkg/controller/security"
+	"kmesh.net/kmesh/pkg/dns"
 	"kmesh.net/kmesh/pkg/logger"
 	"kmesh.net/kmesh/pkg/utils"
 )
 
 var (
-	stopCh = make(chan struct{})
-	log    = logger.NewLoggerField("controller")
+	stopCh      = make(chan struct{})
+	ctx, cancle = context.WithCancel(context.Background())
+	log         = logger.NewLoggerField("controller")
 )
 
 type Controller struct {
-	mode           string
-	bpfWorkloadObj *bpf.BpfKmeshWorkload
-	client         *XdsClient
-	enableByPass   bool
+	mode                string
+	bpfWorkloadObj      *bpf.BpfKmeshWorkload
+	client              *XdsClient
+	enableByPass        bool
+	enableSecretManager bool
+	bpfFsPath           string
+	enableBpfLog        bool
 }
 
-func NewController(mode string, enableByPass bool, bpfWorkloadObj *bpf.BpfKmeshWorkload) *Controller {
+func NewController(opts *options.BootstrapConfigs, bpfWorkloadObj *bpf.BpfKmeshWorkload, bpfFsPath string, enableBpfLog bool) *Controller {
 	return &Controller{
-		mode:           mode,
-		enableByPass:   enableByPass,
-		bpfWorkloadObj: bpfWorkloadObj,
+		mode:                opts.BpfConfig.Mode,
+		enableByPass:        opts.ByPassConfig.EnableByPass,
+		bpfWorkloadObj:      bpfWorkloadObj,
+		enableSecretManager: opts.SecretManagerConfig.Enable,
+		bpfFsPath:           bpfFsPath,
+		enableBpfLog:        enableBpfLog,
 	}
 }
 
 func (c *Controller) Start() error {
-	if c.enableByPass {
-		clientset, err := utils.GetK8sclient()
-		if err != nil {
-			return err
-		}
+	clientset, err := utils.GetK8sclient()
+	if err != nil {
+		return err
+	}
 
+	kmeshManageController, err := manage.NewKmeshManageController(clientset)
+	if err != nil {
+		return fmt.Errorf("failed to start kmesh manage controller: %v", err)
+	}
+	kmeshManageController.Run()
+
+	log.Info("start kmesh manage controller successfully")
+
+	if c.enableByPass {
 		err = bypass.StartByPassController(clientset)
 		if err != nil {
 			return fmt.Errorf("failed to start bypass controller: %v", err)
@@ -66,14 +85,34 @@ func (c *Controller) Start() error {
 		return nil
 	}
 
-	secertManager, err := security.NewSecretManager()
-	if err != nil {
-		return fmt.Errorf("secretManager create failed: %v", err)
+	if c.enableBpfLog {
+		if err := logger.StartRingBufReader(ctx, c.mode, c.bpfFsPath); err != nil {
+			return fmt.Errorf("fail to start ringbuf reader: %v", err)
+		}
+	}
+	c.client = NewXdsClient(c.mode, c.bpfWorkloadObj)
+
+	if c.client.WorkloadController != nil {
+		if c.enableSecretManager {
+			secertManager, err := security.NewSecretManager()
+			if err != nil {
+				return fmt.Errorf("secretManager create failed: %v", err)
+			}
+			go secertManager.Run(stopCh)
+			c.client.WorkloadController.Processor.SecretManager = secertManager
+		}
+		if c.client.WorkloadController.Rbac != nil {
+			go c.client.WorkloadController.Rbac.Run(c.client.ctx, c.bpfWorkloadObj.SockOps.MapOfTuple, c.bpfWorkloadObj.XdpAuth.MapOfAuth)
+		}
 	}
 
-	c.client = NewXdsClient(c.mode, c.bpfWorkloadObj)
-	if c.client.workloadController != nil {
-		c.client.workloadController.Processor.Sm = secertManager
+	if c.client.AdsController != nil {
+		dnsResolver, err := dns.NewDNSResolver(c.client.AdsController.Processor.Cache)
+		if err != nil {
+			return fmt.Errorf("dns resolver create failed: %v", err)
+		}
+		dnsResolver.StartDNSResolver(stopCh)
+		c.client.AdsController.Processor.DnsResolverChan = dnsResolver.DnsResolverChan
 	}
 
 	return c.client.Run(stopCh)
@@ -84,6 +123,7 @@ func (c *Controller) Stop() {
 		return
 	}
 	close(stopCh)
+	cancle()
 	if c.client != nil {
 		c.client.Close()
 	}

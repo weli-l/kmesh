@@ -17,58 +17,63 @@
 package cache
 
 import (
+	"net/netip"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
 
 	"kmesh.net/kmesh/api/v2/workloadapi"
-	"kmesh.net/kmesh/pkg/nets"
 )
 
-var (
-	WorkloadCache = newWorkloadStore()
-)
+type WorkloadCache interface {
+	GetWorkloadByUid(uid string) *workloadapi.Workload
+	GetWorkloadByAddr(networkAddress NetworkAddress) *workloadapi.Workload
+	AddWorkload(workload *workloadapi.Workload)
+	DeleteWorkload(uid string)
+	List() []*workloadapi.Workload
+}
 
 type NetworkAddress struct {
 	Network string
-	Address uint32
+	Address netip.Addr
 }
 
-type workloadStore struct {
+type cache struct {
 	byUid  map[string]*workloadapi.Workload
 	byAddr map[NetworkAddress]*workloadapi.Workload
 	mutex  sync.RWMutex
 }
 
-func newWorkloadStore() *workloadStore {
-	return &workloadStore{
+func NewWorkloadCache() *cache {
+	return &cache{
 		byUid:  make(map[string]*workloadapi.Workload),
 		byAddr: make(map[NetworkAddress]*workloadapi.Workload),
 	}
 }
 
-func (w *workloadStore) GetWorkloadByUid(uid string) *workloadapi.Workload {
+func (w *cache) GetWorkloadByUid(uid string) *workloadapi.Workload {
 	w.mutex.RLock()
 	defer w.mutex.RUnlock()
 	return w.byUid[uid]
 }
 
-func (w *workloadStore) GetWorkloadByAddr(networkAddress NetworkAddress) *workloadapi.Workload {
+func (w *cache) GetWorkloadByAddr(networkAddress NetworkAddress) *workloadapi.Workload {
 	w.mutex.RLock()
 	defer w.mutex.RUnlock()
 	return w.byAddr[networkAddress]
 }
 
-func composeNetworkAddress(network string, addr uint32) NetworkAddress {
-	networkAddress := NetworkAddress{
+func composeNetworkAddress(network string, addr netip.Addr) NetworkAddress {
+	return NetworkAddress{
 		Network: network,
 		Address: addr,
 	}
-
-	return networkAddress
 }
 
-func (w *workloadStore) AddWorkload(workload *workloadapi.Workload) {
+func (w *cache) AddWorkload(workload *workloadapi.Workload) {
+	if workload == nil {
+		return
+	}
 	uid := workload.Uid
 
 	w.mutex.Lock()
@@ -81,7 +86,7 @@ func (w *workloadStore) AddWorkload(workload *workloadapi.Workload) {
 		}
 		// remove same uid but old address workload, avoid leak worklaod by address.
 		for _, ip := range workloadByUid.Addresses {
-			addr := nets.ConvertIpByteToUint32(ip)
+			addr, _ := netip.AddrFromSlice(ip)
 			networkAddress := composeNetworkAddress(workloadByUid.Network, addr)
 			delete(w.byAddr, networkAddress)
 		}
@@ -89,24 +94,35 @@ func (w *workloadStore) AddWorkload(workload *workloadapi.Workload) {
 
 	w.byUid[uid] = workload
 	for _, ip := range workload.Addresses {
-		addr := nets.ConvertIpByteToUint32(ip)
+		addr, _ := netip.AddrFromSlice(ip)
 		networkAddress := composeNetworkAddress(workload.Network, addr)
 		w.byAddr[networkAddress] = workload
 	}
 }
 
-func (w *workloadStore) DeleteWorkload(uid string) {
+func (w *cache) DeleteWorkload(uid string) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
 	workload, exist := w.byUid[uid]
 	if exist {
 		for _, ip := range workload.Addresses {
-			addr := nets.ConvertIpByteToUint32(ip)
+			addr, _ := netip.AddrFromSlice(ip)
 			networkAddress := composeNetworkAddress(workload.Network, addr)
 			delete(w.byAddr, networkAddress)
 		}
 
 		delete(w.byUid, uid)
 	}
+}
+
+func (w *cache) List() []*workloadapi.Workload {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	out := make([]*workloadapi.Workload, 0, len(w.byUid))
+	for _, workload := range w.byUid {
+		out = append(out, workload)
+	}
+
+	return out
 }

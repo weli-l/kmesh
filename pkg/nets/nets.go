@@ -20,6 +20,9 @@ package nets
 import (
 	"encoding/binary"
 	"net"
+	"syscall"
+
+	"kmesh.net/kmesh/pkg/constants"
 )
 
 // ConvertIpToUint32 converts ip to little-endian uint32 format
@@ -38,13 +41,6 @@ func ConvertIpToUint32(ip string) uint32 {
 	return 0
 }
 
-// ConvertUint32ToIp converts big-endian uint32 to ip format
-func ConvertUint32ToIp(big uint32) string {
-	netIP := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(netIP, big)
-	return netIP.String()
-}
-
 // ConvertPortToBigEndian convert uint32 to network order
 func ConvertPortToBigEndian(little uint32) uint32 {
 	// first convert to uint16, then convert the byte order,
@@ -56,7 +52,98 @@ func ConvertPortToBigEndian(little uint32) uint32 {
 	return uint32(big16)
 }
 
-// ConvertIpByteToUint32 converts ip to little-endian uint32 format
-func ConvertIpByteToUint32(ip []byte) uint32 {
-	return binary.LittleEndian.Uint32(ip)
+func CopyIpByteFromSlice(dst *[16]byte, src *[]byte) {
+	len := len(*src)
+	if len != 4 && len != 16 {
+		return
+	}
+
+	for i := 0; i < len; i++ {
+		(*dst)[i] = (*src)[i]
+	}
+}
+
+func checkIPVersion() (ipv4, ipv6 bool) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false, false
+	}
+
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+
+		if ip := ipnet.IP; ip != nil {
+			if ip.To4() != nil {
+				ipv4 = true
+			} else if ip.To16() != nil {
+				ipv6 = true
+			}
+		}
+	}
+
+	return ipv4, ipv6
+}
+
+func triggerControlCommandWithPortInV4(port int) error {
+	ip := net.ParseIP(constants.ControlCommandIp4)
+	sockfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(sockfd)
+
+	if err = syscall.SetNonblock(sockfd, true); err != nil {
+		return err
+	}
+	err = syscall.Connect(sockfd, &syscall.SockaddrInet4{
+		Port: port,
+		Addr: [4]byte(ip.To4()),
+	})
+	if err == nil {
+		return err
+	}
+	errno, ok := err.(syscall.Errno)
+	if ok && errno == syscall.EINPROGRESS { // -EINPROGRESS, Operation now in progress
+		return nil
+	}
+	return err
+}
+
+func triggerControlCommandWithPortInV6(port int) error {
+	ip := net.ParseIP(constants.ControlCommandIp6)
+	sockfd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(sockfd)
+
+	if err = syscall.SetNonblock(sockfd, true); err != nil {
+		return err
+	}
+	err = syscall.Connect(sockfd, &syscall.SockaddrInet6{
+		Port: port,
+		Addr: [16]byte(ip.To16()),
+	})
+	if err == nil {
+		return err
+	}
+	errno, ok := err.(syscall.Errno)
+	if ok && errno == syscall.EINPROGRESS { // -EINPROGRESS, Operation now in progress
+		return nil
+	}
+	return err
+}
+
+func TriggerControlCommand(oper int) error {
+	ipv4, ipv6 := checkIPVersion()
+	if ipv4 {
+		return triggerControlCommandWithPortInV4(oper)
+	}
+	if ipv6 {
+		return triggerControlCommandWithPortInV6(oper)
+	}
+	return nil
 }

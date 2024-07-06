@@ -33,10 +33,12 @@ out/
 # build binaries       
 kmesh-cni
 kmesh-daemon
+
+# go test coverage
+coverage.out
 # build artifacts
 *.so
 *.o
-bpf/include/bpf_helper_defs_ext.h
 bpf/kmesh/bpf2go/kmeshcgroupsock_bpfeb.go
 bpf/kmesh/bpf2go/kmeshcgroupsock_bpfel.go
 bpf/kmesh/bpf2go/kmeshcgroupsockworkload_bpfeb.go

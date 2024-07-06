@@ -37,7 +37,7 @@ import (
 
 func TestRecoverConnection(t *testing.T) {
 	t.Run("test reconnect success", func(t *testing.T) {
-		utClient := NewXdsClient("ads", &bpf.BpfKmeshWorkload{})
+		utClient := NewXdsClient(constants.AdsMode, &bpf.BpfKmeshWorkload{})
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
 		iteration := 0
@@ -50,7 +50,7 @@ func TestRecoverConnection(t *testing.T) {
 				return nil, errors.New("failed to create grpc connect")
 			} else {
 				// returns a fake grpc connection
-				mockDiscovery := xdstest.NewMockServer(t)
+				mockDiscovery := xdstest.NewXdsServer(t)
 				return grpc.Dial("buffcon",
 					grpc.WithTransportCredentials(insecure.NewCredentials()),
 					grpc.WithBlock(),
@@ -69,7 +69,7 @@ func TestClientResponseProcess(t *testing.T) {
 		netPatches := gomonkey.NewPatches()
 		defer netPatches.Reset()
 		netPatches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
-			mockDiscovery := xdstest.NewMockServer(t)
+			mockDiscovery := xdstest.NewXdsServer(t)
 			return grpc.Dial("buffcon",
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithBlock(),
@@ -116,7 +116,7 @@ func TestClientResponseProcess(t *testing.T) {
 		netPatches := gomonkey.NewPatches()
 		defer netPatches.Reset()
 		netPatches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
-			mockDiscovery := xdstest.NewMockServer(t)
+			mockDiscovery := xdstest.NewXdsServer(t)
 			return grpc.Dial("buffcon",
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithBlock(),
@@ -144,7 +144,7 @@ func TestClientResponseProcess(t *testing.T) {
 			})
 		streamPatches := gomonkey.NewPatches()
 		defer streamPatches.Reset()
-		streamPatches.ApplyMethod(reflect.TypeOf(utClient.workloadController), "HandleWorkloadStream",
+		streamPatches.ApplyMethod(reflect.TypeOf(utClient.WorkloadController), "HandleWorkloadStream",
 			func(_ *workload.Controller) error {
 				if iteration < 2 {
 					return errors.New("stream recv failed")

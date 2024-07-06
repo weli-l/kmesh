@@ -25,7 +25,6 @@ import (
 	"google.golang.org/grpc"
 	istiogrpc "istio.io/istio/pilot/pkg/grpc"
 
-	"kmesh.net/kmesh/pkg/auth"
 	"kmesh.net/kmesh/pkg/bpf"
 	"kmesh.net/kmesh/pkg/constants"
 	"kmesh.net/kmesh/pkg/controller/ads"
@@ -45,20 +44,18 @@ type XdsClient struct {
 	grpcConn           *grpc.ClientConn
 	client             discoveryv3.AggregatedDiscoveryServiceClient
 	AdsController      *ads.Controller
-	workloadController *workload.Controller
+	WorkloadController *workload.Controller
 	xdsConfig          *config.XdsConfig
-	rbac               *auth.Rbac
 }
 
-func NewXdsClient(mode string, bpfWorkloadObj *bpf.BpfKmeshWorkload) *XdsClient {
+func NewXdsClient(mode string, bpfWorkload *bpf.BpfKmeshWorkload) *XdsClient {
 	client := &XdsClient{
 		mode:      mode,
 		xdsConfig: config.GetConfig(mode),
 	}
 
 	if mode == constants.WorkloadMode {
-		client.rbac = auth.NewRbac(bpfWorkloadObj)
-		client.workloadController = workload.NewController(bpfWorkloadObj.SockConn.KmeshCgroupSockWorkloadObjects.KmeshCgroupSockWorkloadMaps)
+		client.WorkloadController = workload.NewController(bpfWorkload)
 	} else if mode == constants.AdsMode {
 		client.AdsController = ads.NewController()
 	}
@@ -77,7 +74,7 @@ func (c *XdsClient) createGrpcStreamClient() error {
 	c.client = discoveryv3.NewAggregatedDiscoveryServiceClient(c.grpcConn)
 
 	if c.mode == constants.WorkloadMode {
-		if err = c.workloadController.WorkloadStreamCreateAndSend(c.client, c.ctx); err != nil {
+		if err = c.WorkloadController.WorkloadStreamCreateAndSend(c.client, c.ctx); err != nil {
 			_ = c.grpcConn.Close()
 			return fmt.Errorf("create workload stream failed, %s", err)
 		}
@@ -133,8 +130,8 @@ func (c *XdsClient) handleUpstream(ctx context.Context) {
 					continue
 				}
 			} else if c.mode == constants.WorkloadMode {
-				if err = c.workloadController.HandleWorkloadStream(c.rbac); err != nil {
-					_ = c.workloadController.Stream.CloseSend()
+				if err = c.WorkloadController.HandleWorkloadStream(); err != nil {
+					_ = c.WorkloadController.Stream.CloseSend()
 					_ = c.grpcConn.Close()
 					reconnect = true
 					continue
@@ -154,9 +151,6 @@ func (c *XdsClient) Run(stopCh <-chan struct{}) error {
 	}
 
 	go c.handleUpstream(c.ctx)
-	if c.rbac != nil {
-		go c.rbac.Run(c.ctx)
-	}
 
 	go func() {
 		<-stopCh
@@ -173,8 +167,8 @@ func (c *XdsClient) closeStreamClient() {
 	if c.AdsController != nil && c.AdsController.Stream != nil {
 		_ = c.AdsController.Stream.CloseSend()
 	}
-	if c.workloadController != nil && c.workloadController.Stream != nil {
-		_ = c.workloadController.Stream.CloseSend()
+	if c.WorkloadController != nil && c.WorkloadController.Stream != nil {
+		_ = c.WorkloadController.Stream.CloseSend()
 	}
 
 	if c.grpcConn != nil {

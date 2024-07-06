@@ -1,21 +1,6 @@
-/*
- * Copyright 2024 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Kmesh */
 
- * Author: kwb0523
- * Create: 2024-01-20
- */
 #ifndef __KMESH_FRONTEND_H__
 #define __KMESH_FRONTEND_H__
 
@@ -28,7 +13,7 @@ static inline frontend_value *map_lookup_frontend(const frontend_key *key)
     return kmesh_map_lookup_elem(&map_of_frontend, key);
 }
 
-static inline int frontend_manager(ctx_buff_t *ctx, frontend_value *frontend_v)
+static inline int frontend_manager(struct kmesh_context *kmesh_ctx, frontend_value *frontend_v)
 {
     int ret = 0;
     service_key service_k = {0};
@@ -51,21 +36,21 @@ static inline int frontend_manager(ctx_buff_t *ctx, frontend_value *frontend_v)
 
     if (direct_backend) {
         // For pod direct access, if a pod has watpoint captured, we will redirect to waypoint, otherwise we do nothing.
-        if (backend_v->waypoint_addr != 0 && backend_v->waypoint_port != 0) {
+        if (backend_v->waypoint_port != 0) {
             BPF_LOG(
                 DEBUG,
                 FRONTEND,
-                "find waypoint addr=[%pI4h:%u]",
-                &backend_v->waypoint_addr,
+                "find waypoint addr=[%s:%u]\n",
+                ip2str(&backend_v->wp_addr, kmesh_ctx->ctx->family == AF_INET),
                 bpf_ntohs(backend_v->waypoint_port));
-            ret = waypoint_manager(ctx, backend_v->waypoint_addr, backend_v->waypoint_port);
-            if (ret == -ENOEXEC) {
+            ret = waypoint_manager(kmesh_ctx, &backend_v->wp_addr, backend_v->waypoint_port);
+            if (ret != 0) {
                 BPF_LOG(ERR, BACKEND, "waypoint_manager failed, ret:%d\n", ret);
-                return ret;
             }
+            return ret;
         }
     } else {
-        ret = service_manager(ctx, frontend_v->upstream_id, service_v);
+        ret = service_manager(kmesh_ctx, frontend_v->upstream_id, service_v);
         if (ret != 0) {
             if (ret != -ENOENT)
                 BPF_LOG(ERR, FRONTEND, "service_manager failed, ret:%d\n", ret);

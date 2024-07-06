@@ -20,7 +20,30 @@ const (
 	AdsMode      = "ads"
 	WorkloadMode = "workload"
 
+	// DataPlaneModeLabel is the label used to indicate the data plane mode
+	DataPlaneModeLabel = "istio.io/dataplane-mode"
+	// DataPlaneModeKmesh is the value of the label to indicate the data plane mode is kmesh
+	DataPlaneModeKmesh = "kmesh"
+
 	XDP_PROG_NAME = "xdp_shutdown"
 
 	RootCertPath = "/var/run/secrets/istio/root-cert.pem"
+
+	BPF_LOG_ERR   = 0
+	BPF_LOG_WARN  = 1
+	BPF_LOG_INFO  = 2
+	BPF_LOG_DEBUG = 3
+
+	// Ip(0.0.0.2 | ::2) used for control command, e.g. KmeshControl | ByPass
+	ControlCommandIp4 = "0.0.0.2"
+	ControlCommandIp6 = "::2"
+	// Oper code for control command
+	OperEnableControl  = 929
+	OperDisableControl = 930
+	OperEnableBypass   = 931
+	OperDisableByPass  = 932
+
+	// tail call index in tail call prog map
+	TailCallConnect4Index = 0
+	TailCallConnect6Index = 1
 )

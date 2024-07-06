@@ -17,37 +17,28 @@
 package bypass
 
 import (
-	"bytes"
 	"context"
-	"embed"
 	"fmt"
-	"io"
-	"io/fs"
-	"net"
 	"os"
-	"path"
-	"strings"
-	"syscall"
 	"time"
 
 	netns "github.com/containernetworking/plugins/pkg/ns"
-	nd "istio.io/istio/cni/pkg/nodeagent"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
+	"kmesh.net/kmesh/pkg/constants"
+	ns "kmesh.net/kmesh/pkg/controller/netns"
 	"kmesh.net/kmesh/pkg/logger"
+	"kmesh.net/kmesh/pkg/nets"
 	"kmesh.net/kmesh/pkg/utils"
 )
 
 var (
 	log = logger.NewLoggerField("bypass")
-	FS  embed.FS
 )
 
 const (
@@ -88,7 +79,7 @@ func StartByPassController(client kubernetes.Interface) error {
 				return
 			}
 
-			nspath, _ := getnspath(pod)
+			nspath, _ := ns.GetPodNSpath(pod)
 
 			if enableSidecar {
 				if err := addIptables(nspath); err != nil {
@@ -103,37 +94,37 @@ func StartByPassController(client kubernetes.Interface) error {
 				}
 			}
 		},
-		DeleteFunc: func(obj interface{}) {
-			if _, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				return
-			}
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				log.Errorf("expected *corev1.Pod but got %T", obj)
-				return
-			}
-
-			if isPodBeingDeleted(pod) {
-				log.Debugf("%s/%s: Pod is being deleted, skipping further processing", pod.GetNamespace(), pod.GetName())
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod, okOld := oldObj.(*corev1.Pod)
+			newPod, okNew := newObj.(*corev1.Pod)
+			if !okOld || !okNew {
+				log.Errorf("expected *corev1.Pod but got %T and %T", oldObj, newObj)
 				return
 			}
 
-			log.Infof("%s/%s: disable bypass control", pod.GetNamespace(), pod.GetName())
-			enableSidecar, _ := checkSidecar(client, pod)
-			enableKmesh := isKmeshManaged(pod)
+			if isPodBeingDeleted(newPod) {
+				log.Debugf("%s/%s: Pod is being deleted, skipping further processing", newPod.GetNamespace(), newPod.GetName())
+				return
+			}
 
-			if enableSidecar {
-				nspath, _ := getnspath(pod)
-				if err := deleteIptables(nspath); err != nil {
-					log.Errorf("failed to add iptables rules for %s: %v", nspath, err)
-					return
+			if shouldEnroll(oldPod) && !shouldEnroll(newPod) {
+				log.Infof("%s/%s: disable bypass control", newPod.GetNamespace(), newPod.GetName())
+				enableSidecar, _ := checkSidecar(client, newPod)
+				enableKmesh := isKmeshManaged(newPod)
+
+				if enableSidecar {
+					nspath, _ := ns.GetPodNSpath(newPod)
+					if err := deleteIptables(nspath); err != nil {
+						log.Errorf("failed to add iptables rules for %s: %v", nspath, err)
+						return
+					}
 				}
-			}
-			if enableKmesh {
-				nspath, _ := getnspath(pod)
-				if err := handleKmeshBypass(nspath, 0); err != nil {
-					log.Errorf("failed to disable bypass control")
-					return
+				if enableKmesh {
+					nspath, _ := ns.GetPodNSpath(newPod)
+					if err := handleKmeshBypass(nspath, 0); err != nil {
+						log.Errorf("failed to disable bypass control")
+						return
+					}
 				}
 			}
 		},
@@ -146,44 +137,30 @@ func StartByPassController(client kubernetes.Interface) error {
 	return nil
 }
 
+func shouldEnroll(pod *corev1.Pod) bool {
+	enabled := pod.Labels["kmesh.net/bypass"]
+	return enabled == "enabled"
+}
+
 func handleKmeshBypass(ns string, oper int) error {
 	execFunc := func(netns.NetNS) error {
 		/*
 		 * This function is used to process pods that are marked
 		 * or deleted with the bypass label on the current node.
 		 * Attempt to connect to a special IP address. The
-		 * connection triggers the cgroup/connect4 ebpf
+		 * connection triggers the cgroup/connect4/6 ebpf
 		 * program and records the netns cookie information
 		 * of the current connection. The cookie can be used
 		 * to determine whether the pod is been bypass.
-		 * 0.0.0.1:<port> is "cipher key" for cgroup/connect4
+		 * ControlCommandIp4/6:<port> is "cipher key" for cgroup/connect4/6
 		 * ebpf program. 931/932 is the specific port handled by
 		 * daemon to enable/disable bypass
 		 */
-		simip := net.ParseIP("0.0.0.1")
-		port := 931
+		port := constants.OperEnableBypass
 		if oper == 0 {
-			port = 932
+			port = constants.OperDisableByPass
 		}
-		sockfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-		if err != nil {
-			return err
-		}
-		if err = syscall.SetNonblock(sockfd, true); err != nil {
-			return err
-		}
-		err = syscall.Connect(sockfd, &syscall.SockaddrInet4{
-			Port: port,
-			Addr: [4]byte(simip.To4()),
-		})
-		if err == nil {
-			return err
-		}
-		errno, ok := err.(syscall.Errno)
-		if ok && errno == 115 { // -EINPROGRESS, Operation now in progress
-			return nil
-		}
-		return err
+		return nets.TriggerControlCommand(port)
 	}
 
 	if err := netns.WithNetNSPath(ns, execFunc); err != nil {
@@ -267,105 +244,4 @@ func isKmeshManaged(pod *corev1.Pod) bool {
 		}
 	}
 	return false
-}
-
-func getnspath(pod *corev1.Pod) (string, error) {
-	res, err := FindNetnsForPod(pod)
-	if err != nil {
-		return "", err
-	}
-	res = path.Join("/proc", res)
-	return res, nil
-}
-
-func BuiltinOrDir(dir string) fs.FS {
-	if dir == "" {
-		return FS
-	}
-	return os.DirFS(dir)
-}
-
-func FindNetnsForPod(pod *corev1.Pod) (string, error) {
-	netnsObserved := sets.New[uint64]()
-	fd := BuiltinOrDir("/proc")
-
-	entries, err := fs.ReadDir(fd, ".")
-	if err != nil {
-		return "", err
-	}
-
-	desiredUID := pod.UID
-	for _, entry := range entries {
-		res, err := processEntry(fd, netnsObserved, desiredUID, entry)
-		if err != nil {
-			log.Debugf("error processing entry: %s %v", entry.Name(), err)
-			continue
-		}
-		if res != "" {
-			return res, nil
-		}
-	}
-	return "", fmt.Errorf("No matching network namespace found")
-}
-
-func isNotNumber(r rune) bool {
-	return r < '0' || r > '9'
-}
-
-func isProcess(entry fs.DirEntry) bool {
-	if !entry.IsDir() {
-		return false
-	}
-
-	if strings.IndexFunc(entry.Name(), isNotNumber) != -1 {
-		return false
-	}
-	return true
-}
-
-// copied from istio/cni/pkg/nodeagent/podcgroupns.go
-func processEntry(proc fs.FS, netnsObserved sets.Set[uint64], filter types.UID, entry fs.DirEntry) (string, error) {
-	if !isProcess(entry) {
-		return "", nil
-	}
-
-	netnsName := path.Join(entry.Name(), "ns", "net")
-	fi, err := fs.Stat(proc, netnsName)
-	if err != nil {
-		return "", err
-	}
-
-	inode, err := nd.GetInode(fi)
-	if err != nil {
-		return "", err
-	}
-	if _, ok := netnsObserved[inode]; ok {
-		log.Debugf("netns: %d already processed. skipping", inode)
-		return "", nil
-	}
-
-	cgroup, err := proc.Open(path.Join(entry.Name(), "cgroup"))
-	if err != nil {
-		return "", nil
-	}
-	defer cgroup.Close()
-
-	var cgroupData bytes.Buffer
-	_, err = io.Copy(&cgroupData, cgroup)
-	if err != nil {
-		return "", nil
-	}
-
-	uid, _, err := nd.GetPodUIDAndContainerID(cgroupData)
-	if err != nil {
-		return "", err
-	}
-
-	if filter != uid {
-		return "", nil
-	}
-
-	log.Debugf("found pod to netns: %s %d", uid, inode)
-
-	return netnsName, nil
 }

@@ -1,21 +1,5 @@
-/*
- * Copyright 2024 The Kmesh Authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
-
- * Author: kwb0523
- * Create: 2024-01-20
- */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Kmesh */
 
 #ifndef __KMESH_WORKLOAD_H__
 #define __KMESH_WORKLOAD_H__
@@ -28,7 +12,7 @@
 
 // frontend map
 typedef struct {
-    __u32 ipv4; // Service ip or Pod ip
+    struct ip_addr addr; // Service ip or Pod ip
 } __attribute__((packed)) frontend_key;
 
 typedef struct {
@@ -46,7 +30,7 @@ typedef struct {
     __u32 service_port[MAX_PORT_COUNT]; // service_port[i] and target_port[i] are a pair, i starts from 0 and max value
                                         // is MAX_PORT_COUNT-1
     __u32 target_port[MAX_PORT_COUNT];
-    __u32 waypoint_addr;
+    struct ip_addr wp_addr;
     __u32 waypoint_port;
 } __attribute__((packed)) service_value;
 
@@ -66,10 +50,10 @@ typedef struct {
 } __attribute__((packed)) backend_key;
 
 typedef struct {
-    __u32 ipv4; // backend ip
+    struct ip_addr addr;
     __u32 service_count;
     __u32 service[MAX_SERVICE_COUNT];
-    __u32 waypoint_addr;
+    struct ip_addr wp_addr;
     __u32 waypoint_port;
 } __attribute__((packed)) backend_value;
 
