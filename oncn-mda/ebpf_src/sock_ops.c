@@ -198,7 +198,7 @@ filter(const struct sock_key *const key, const struct sock_key *const peer_key, 
 
     struct uid_gid_info current_uid_gid = {0};
     if (get_current_uid_gid(&current_uid_gid, skops) < 0) {
-        return FILTER_RETURN
+        return FILTER_RETURN;
     }
 
     if (get_peer_uid_gid(peer_key, &current_uid_gid) != SUCCESS) {
