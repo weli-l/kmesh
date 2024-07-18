@@ -65,111 +65,131 @@ type QueueItem struct {
 	action string
 }
 
+type KmeshManageController struct {
+	informerFactory informers.SharedInformerFactory
+	podInformer     cache.SharedIndexInformer
+	nsInformer      cache.SharedIndexInformer
+	queue           workqueue.RateLimitingInterface
+	client          kubernetes.Interface
+}
+
 func NewKmeshManageController(client kubernetes.Interface, security *kmeshsecurity.SecretManager) (*KmeshManageController, error) {
 	nodeName := os.Getenv("NODE_NAME")
 
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(client, DefaultInformerSyncPeriod,
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.FieldSelector = fmt.Sprintf("spec.nodeName=%s", nodeName)
-		}))
-
+	informerFactory := createInformerFactory(client, nodeName)
 	podInformer := informerFactory.Core().V1().Pods().Informer()
+	nsInformer := informerFactory.Core().V1().Namespaces().Informer()
+
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				log.Errorf("expected *corev1.Pod but got %T", obj)
-				return
-			}
-			if !shouldEnroll(client, pod) {
-				return
-			}
-
-			log.Infof("%s/%s: enable Kmesh manage", pod.GetNamespace(), pod.GetName())
-
-			nspath, _ := ns.GetPodNSpath(pod)
-
-			if err := handleKmeshManage(nspath, true); err != nil {
-				log.Errorf("failed to enable Kmesh manage")
-				return
-			}
-			queue.AddRateLimited(QueueItem{pod: pod, action: ActionAddAnnotation})
-			sendCertRequest(security, pod, kmeshsecurity.ADD)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod, okOld := oldObj.(*corev1.Pod)
-			newPod, okNew := newObj.(*corev1.Pod)
-			if !okOld || !okNew {
-				log.Errorf("expected *corev1.Pod but got %T and %T", oldObj, newObj)
-				return
-			}
-
-			//add Kmesh manage label for enable Kmesh control
-			if !shouldEnroll(client, oldPod) && shouldEnroll(client, newPod) {
-				log.Infof("%s/%s: enable Kmesh manage", newPod.GetNamespace(), newPod.GetName())
-
-				nspath, _ := ns.GetPodNSpath(newPod)
-
-				if err := handleKmeshManage(nspath, true); err != nil {
-					log.Errorf("failed to enable Kmesh manage")
-					return
-				}
-				queue.AddRateLimited(QueueItem{pod: newPod, action: ActionAddAnnotation})
-				sendCertRequest(security, newPod, kmeshsecurity.ADD)
-			}
-
-			//delete Kmesh manage label for disable Kmesh control
-			if shouldEnroll(client, oldPod) && !shouldEnroll(client, newPod) {
-				log.Infof("%s/%s: disable Kmesh manage", newPod.GetNamespace(), newPod.GetName())
-
-				nspath, _ := ns.GetPodNSpath(newPod)
-				if err := handleKmeshManage(nspath, false); err != nil {
-					log.Errorf("failed to disable Kmesh manage")
-					return
-				}
-
-				queue.AddRateLimited(QueueItem{pod: newPod, action: ActionDeleteAnnotation})
-				sendCertRequest(security, oldPod, kmeshsecurity.DELETE)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-				if !ok {
-					log.Errorf("couldn't get object from tombstone %#v", obj)
-					return
-				}
-				pod, ok = tombstone.Obj.(*corev1.Pod)
-				if !ok {
-					log.Errorf("tombstone contained object that is not a Job %#v", obj)
-					return
-				}
-			}
-			if shouldEnroll(client, pod) {
-				log.Infof("%s/%s: Pod managed by Kmesh is being deleted", pod.GetNamespace(), pod.GetName())
-				sendCertRequest(security, pod, kmeshsecurity.DELETE)
-			}
-		},
-	}); err != nil {
+	if err := addPodEventHandlers(podInformer, client, security, queue); err != nil {
 		return nil, fmt.Errorf("failed to add event handler to podInformer: %v", err)
+	}
+
+	if err := addNamespaceEventHandlers(nsInformer, client, queue); err != nil {
+		return nil, fmt.Errorf("failed to add event handler to nsInformer: %v", err)
 	}
 
 	return &KmeshManageController{
 		informerFactory: informerFactory,
 		podInformer:     podInformer,
+		nsInformer:      nsInformer,
 		queue:           queue,
 		client:          client,
 	}, nil
 }
 
-type KmeshManageController struct {
-	informerFactory informers.SharedInformerFactory
-	podInformer     cache.SharedIndexInformer
-	queue           workqueue.RateLimitingInterface
-	client          kubernetes.Interface
+func createInformerFactory(client kubernetes.Interface, nodeName string) informers.SharedInformerFactory {
+	return informers.NewSharedInformerFactoryWithOptions(client, DefaultInformerSyncPeriod,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fmt.Sprintf("spec.nodeName=%s", nodeName)
+		}))
+}
+
+func addPodEventHandlers(podInformer cache.SharedIndexInformer, client kubernetes.Interface, security *kmeshsecurity.SecretManager, queue workqueue.RateLimitingInterface) error {
+	_, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { handlePodAdd(obj, client, security, queue) },
+		UpdateFunc: func(oldObj, newObj interface{}) { handlePodUpdate(oldObj, newObj, client, security, queue) },
+		DeleteFunc: func(obj interface{}) { handlePodDelete(obj, client, security) },
+	})
+	return err
+}
+
+func addNamespaceEventHandlers(nsInformer cache.SharedIndexInformer, client kubernetes.Interface, queue workqueue.RateLimitingInterface) error {
+	// 添加nsInformer的事件处理程序
+
+}
+
+func handlePodAdd(obj interface{}, client kubernetes.Interface, security *kmeshsecurity.SecretManager, queue workqueue.RateLimitingInterface) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		log.Errorf("expected *corev1.Pod but got %T", obj)
+		return
+	}
+	if !shouldEnroll(client, pod) {
+		return
+	}
+
+	log.Infof("%s/%s: enable Kmesh manage", pod.GetNamespace(), pod.GetName())
+	nspath, _ := ns.GetPodNSpath(pod)
+
+	if err := handleKmeshManage(nspath, true); err != nil {
+		log.Errorf("failed to enable Kmesh manage")
+		return
+	}
+	queue.AddRateLimited(QueueItem{pod: pod, action: ActionAddAnnotation})
+	sendCertRequest(security, pod, kmeshsecurity.ADD)
+}
+
+func handlePodUpdate(oldObj, newObj interface{}, client kubernetes.Interface, security *kmeshsecurity.SecretManager, queue workqueue.RateLimitingInterface) {
+	oldPod, okOld := oldObj.(*corev1.Pod)
+	newPod, okNew := newObj.(*corev1.Pod)
+	if !okOld || !okNew {
+		log.Errorf("expected *corev1.Pod but got %T and %T", oldObj, newObj)
+		return
+	}
+
+	if !shouldEnroll(client, oldPod) && shouldEnroll(client, newPod) {
+		log.Infof("%s/%s: enable Kmesh manage", newPod.GetNamespace(), newPod.GetName())
+		nspath, _ := ns.GetPodNSpath(newPod)
+		if err := handleKmeshManage(nspath, true); err != nil {
+			log.Errorf("failed to enable Kmesh manage")
+			return
+		}
+		queue.AddRateLimited(QueueItem{pod: newPod, action: ActionAddAnnotation})
+		sendCertRequest(security, newPod, kmeshsecurity.ADD)
+	}
+
+	if shouldEnroll(client, oldPod) && !shouldEnroll(client, newPod) {
+		log.Infof("%s/%s: disable Kmesh manage", newPod.GetNamespace(), newPod.GetName())
+		nspath, _ := ns.GetPodNSpath(newPod)
+		if err := handleKmeshManage(nspath, false); err != nil {
+			log.Errorf("failed to disable Kmesh manage")
+			return
+		}
+		queue.AddRateLimited(QueueItem{pod: newPod, action: ActionDeleteAnnotation})
+		sendCertRequest(security, oldPod, kmeshsecurity.DELETE)
+	}
+}
+
+func handlePodDelete(obj interface{}, client kubernetes.Interface, security *kmeshsecurity.SecretManager) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			log.Errorf("couldn't get object from tombstone %#v", obj)
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			log.Errorf("tombstone contained object that is not a Job %#v", obj)
+			return
+		}
+	}
+	if shouldEnroll(client, pod) {
+		log.Infof("%s/%s: Pod managed by Kmesh is being deleted", pod.GetNamespace(), pod.GetName())
+		sendCertRequest(security, pod, kmeshsecurity.DELETE)
+	}
 }
 
 func (c *KmeshManageController) Run(stopChan <-chan struct{}) {
