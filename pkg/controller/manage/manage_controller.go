@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/listers/core/v1"
@@ -86,7 +87,17 @@ func NewKmeshManageController(client kubernetes.Interface, security *kmeshsecuri
 
 	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			handlePodAddFunc(obj, namespaceLister, queue, security)
+			pod, ok := obj.(*corev1.Pod)
+			if !ok {
+				log.Errorf("expected *corev1.Pod but got %T", obj)
+				return
+			}
+
+			if !utils.ShouldEnroll(pod, nil) {
+				return
+			}
+
+			handlePodAddFunc(pod, namespaceLister, queue, security)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			oldPod, okOld := oldObj.(*corev1.Pod)
@@ -106,6 +117,14 @@ func NewKmeshManageController(client kubernetes.Interface, security *kmeshsecuri
 		return nil, fmt.Errorf("failed to add event handler to podInformer: %v", err)
 	}
 
+	if _, err := namespaceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			handleNamespaceUpdateFunc(oldObj, newObj, podLister, queue, security)
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("failed to add event handler to namespaceInformer: %v", err)
+	}
+
 	return &KmeshManageController{
 		informerFactory:   informerFactory,
 		podInformer:       podInformer,
@@ -118,22 +137,7 @@ func NewKmeshManageController(client kubernetes.Interface, security *kmeshsecuri
 	}, nil
 }
 
-func handlePodAddFunc(obj interface{}, namespaceLister v1.NamespaceLister, queue workqueue.RateLimitingInterface, security *kmeshsecurity.SecretManager) {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		log.Errorf("expected *corev1.Pod but got %T", obj)
-		return
-	}
-	namespace, err := namespaceLister.Get(pod.Namespace)
-	if err != nil {
-		log.Errorf("failed to get pod namespace %s: %v", pod.Namespace, err)
-		return
-	}
-
-	if !utils.ShouldEnroll(pod, namespace) {
-		return
-	}
-
+func handlePodAddFunc(pod *corev1.Pod, namespaceLister v1.NamespaceLister, queue workqueue.RateLimitingInterface, security *kmeshsecurity.SecretManager) {
 	log.Infof("%s/%s: enable Kmesh manage", pod.GetNamespace(), pod.GetName())
 	nspath, _ := ns.GetPodNSpath(pod)
 	if err := utils.HandleKmeshManage(nspath, true); err != nil {
@@ -206,6 +210,27 @@ func handlePodDeleteFunc(obj interface{}, security *kmeshsecurity.SecretManager)
 	}
 }
 
+func handleNamespaceUpdateFunc(oldObj, newObj interface{}, podLister v1.PodLister, queue workqueue.RateLimitingInterface, security *kmeshsecurity.SecretManager) {
+	oldNS, okOld := oldObj.(*corev1.Namespace)
+	newNS, okNew := newObj.(*corev1.Namespace)
+	if !okOld || !okNew {
+		return
+	}
+
+	// Compare labels to check if they have actually changed
+	if !utils.ShouldEnroll(nil, oldNS) && utils.ShouldEnroll(nil, newNS) {
+		pods, err := podLister.Pods(newNS.Name).List(labels.Everything())
+		if err != nil {
+			fmt.Printf("Error listing pods: %v\n", err)
+			return
+		}
+
+		for _, pod := range pods {
+			handlePodAddFunc(pod, nil, queue, security)
+		}
+	}
+}
+
 func (c *KmeshManageController) Run(stopChan <-chan struct{}) {
 	defer c.queue.ShutDown()
 	c.informerFactory.Start(stopChan)
@@ -241,11 +266,10 @@ func (c *KmeshManageController) processItems() bool {
 	}
 	if pod != nil {
 		// TODO: handle error
-		namespace, _ := c.namespaceLister.Get(pod.Namespace)
-		if queueItem.action == ActionAddAnnotation && utils.ShouldEnroll(pod, namespace) {
+		if queueItem.action == ActionAddAnnotation && utils.ShouldEnroll(pod, nil) {
 			log.Infof("add annotation for pod %s/%s", pod.Namespace, pod.Name)
 			err = utils.PatchKmeshRedirectAnnotation(c.client, pod)
-		} else if queueItem.action == ActionDeleteAnnotation && !utils.ShouldEnroll(pod, namespace) {
+		} else if queueItem.action == ActionDeleteAnnotation && !utils.ShouldEnroll(pod, nil) {
 			log.Infof("delete annotation for pod %s/%s", pod.Namespace, pod.Name)
 			err = utils.DelKmeshRedirectAnnotation(c.client, pod)
 		}
