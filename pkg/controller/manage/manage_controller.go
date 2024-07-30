@@ -17,7 +17,6 @@
 package kmeshmanage
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -98,7 +97,7 @@ func NewKmeshManageController(client kubernetes.Interface, security *kmeshsecuri
 				return
 			}
 
-			handlePodAddFunc(pod, queue, security)
+			enableKmeshManage(pod, queue, security)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			oldPod, okOld := oldObj.(*corev1.Pod)
@@ -127,7 +126,14 @@ func NewKmeshManageController(client kubernetes.Interface, security *kmeshsecuri
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			handleNamespaceUpdateFunc(oldObj, newObj, podLister, queue, security)
+			oldNS, okOld := oldObj.(*corev1.Namespace)
+			newNS, okNew := newObj.(*corev1.Namespace)
+			if !okOld || !okNew {
+				return
+			}
+			if !reflect.DeepEqual(oldNS.ObjectMeta.Labels, newNS.ObjectMeta.Labels) {
+				handleNamespaceUpdateFunc(oldObj, newObj, podLister, queue, security)
+			}
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add event handler to namespaceInformer: %v", err)
@@ -168,10 +174,6 @@ func disableKmeshManage(pod *corev1.Pod, queue workqueue.RateLimitingInterface, 
 	}
 	queue.AddRateLimited(QueueItem{podName: pod.Name, podNs: pod.Namespace, action: ActionDeleteAnnotation})
 	sendCertRequest(security, pod, kmeshsecurity.DELETE)
-}
-
-func handlePodAddFunc(pod *corev1.Pod, queue workqueue.RateLimitingInterface, security *kmeshsecurity.SecretManager) {
-	enableKmeshManage(pod, queue, security)
 }
 
 func handlePodUpdateFunc(oldObj, newObj interface{}, namespaceLister v1.NamespaceLister, queue workqueue.RateLimitingInterface, security *kmeshsecurity.SecretManager) {
@@ -260,27 +262,8 @@ func processPodsInNamespace(namespace string, podLister v1.PodLister, queue work
 		log.Errorf("Error listing pods: %v", err)
 		return
 	}
-
-	if len(pods) == 0 {
-		clientset, err := utils.GetK8sclient()
-		if err != nil {
-			log.Errorf("Error getting Kubernetes client: %v", err)
-			return
-		}
-
-		podList, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			log.Errorf("Error listing pods from API server for namespace %s: %v", namespace, err)
-			return
-		}
-		for i := range podList.Items {
-			pod := &podList.Items[i]
-			handlePodAddFunc(pod, queue, security)
-		}
-	} else {
-		for _, pod := range pods {
-			handlePodAddFunc(pod, queue, security)
-		}
+	for _, pod := range pods {
+		enableKmeshManage(pod, queue, security)
 	}
 }
 
