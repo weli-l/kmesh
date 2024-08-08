@@ -18,6 +18,8 @@ package bypass
 
 import (
 	"fmt"
+	"os/exec"
+	"strings"
 	"time"
 
 	netns "github.com/containernetworking/plugins/pkg/ns"
@@ -59,7 +61,7 @@ func NewByPassController(client kubernetes.Interface) *Controller {
 				return
 			}
 			if !istio.PodHasSidecar(pod) {
-				log.Infof("pod %s/%s does not have sidecar injected, skip", pod.GetNamespace(), pod.GetName())
+				log.Debugf("pod %s/%s does not have sidecar injected, skip", pod.GetNamespace(), pod.GetName())
 				return
 			}
 
@@ -138,6 +140,27 @@ func isPodBeingDeleted(pod *corev1.Pod) bool {
 	return pod.ObjectMeta.DeletionTimestamp != nil
 }
 
+func RuleExists(args []string) (error, bool) {
+	checkArgs := append(args[:2], append([]string{"-C"}, args[2:]...)...)
+	//checkArgs := []string{args[0], args[1], "-C", args[2], args[3], args[4]}
+	log.Printf("RuleExists CheckArgs: iptables %v", checkArgs)
+	// if err := utils.Execute("iptables", checkArgs); err != nil && strings.Contains(err.Error(), "Bad rule") {
+	// 	return false
+	// }
+	// return true
+	cmd := exec.Command("iptables", checkArgs...)
+
+	err := cmd.Run()
+	if err != nil {
+		// 检查错误信息中是否包含 "No such rule" 或其他类似的提示
+		if strings.Contains(err.Error(), "Bad rule") {
+			return nil, false
+		}
+		return err, false
+	}
+	return nil, true
+}
+
 // TODO: make it a idempotent operation
 func addIptables(ns string) error {
 	iptArgs := [][]string{
@@ -148,6 +171,12 @@ func addIptables(ns string) error {
 	execFunc := func(netns.NetNS) error {
 		log.Infof("Running add iptables rule in namespace:%s", ns)
 		for _, args := range iptArgs {
+			checkArgs := append(args[:2], append(args[3:4], args[5:]...)...)
+			log.Printf("addIptables CheckArgs: iptables %v", checkArgs)
+			if err, exists := RuleExists(checkArgs); err == nil && exists {
+				log.Infof("Rule already exists: iptables %v", args)
+				continue
+			}
 			if err := utils.Execute("iptables", args); err != nil {
 				return fmt.Errorf("failed to exec command: iptables %v\", err: %v", args, err)
 			}
