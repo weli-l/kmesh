@@ -14,7 +14,9 @@
 #define AUTH_DENY  1
 #define UNMATCHED  0
 #define MATCHED    1
-
+#define SUPPORT_IP_MATCH 1
+#define TYPE_SRCIP   (1)
+#define TYPE_DSTIP   (1 << 1)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(__u32));
@@ -124,7 +126,7 @@ int matchDstPorts(struct xdp_md *ctx)
     }
 
     res->match_res = UNMATCHED;
-    return XDP_PASS;
+    bpf_tail_call(ctx, &map_of_tail_call_prog_for_xdp, TAIL_CALL_SRCIP_MATCH);
 
 check_action:
     return (res->action == AUTH_DENY) ? (res->match_res == MATCHED ? XDP_DROP : XDP_PASS) :
@@ -154,6 +156,211 @@ static inline int match_check(struct xdp_md *ctx, void *match, struct bpf_sock_t
     bpf_tail_call(ctx, &map_of_tail_call_prog_for_xdp, TAIL_CALL_PORT_MATCH);
     return XDP_PASS;
 }
+
+#ifdef SUPPORT_IP_MATCH
+static inline __u32 convert_ipv4_to_u32(const struct ProtobufCBinaryData *ipv4_data)
+{
+	if (!ipv4_data->data || ipv4_data->len != 4) {
+		return 0;
+	}
+
+	unsigned char *data = kmesh_get_ptr_val(ipv4_data->data);
+	if (!data) {
+		return 0;
+	}
+
+	return (data[3] << 24) |
+		   (data[2] << 16) |
+		   (data[1] << 8)  |
+		   (data[0] << 0);
+}
+
+
+static inline __u32 convert_ipv6_to_u32(struct ip_addr *rule_addr, const struct ProtobufCBinaryData *ipv6_data)
+{
+	if (!ipv6_data->data || ipv6_data->len != 16) {
+		return 1;
+	}
+
+	unsigned char *v6addr = kmesh_get_ptr_val(ipv6_data->data);
+	if (!v6addr) {
+		return 1;
+	}
+
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			rule_addr->ip6[i] |= (v6addr[i * 4 + j] << (i * 8));
+		}
+	}
+
+	return 0;
+}
+
+static inline int matchIpv4(__u32 ruleIp, __u32 preFixLen, __be32 targetIP)
+{
+	__u32 mask = 0;
+
+	if (preFixLen > 32) {
+		return UNMATCHED;
+	}
+
+	mask = 0xFFFFFFFF >> (32 - preFixLen);
+	if ((ruleIp & mask) == (targetIP & mask)) {
+		BPF_LOG(DEBUG, KMESH, "match ipv4\n");
+		return MATCHED;
+	}
+	return 0;
+}
+
+// reference cilium https://github.com/cilium/cilium/blob/main/bpf/lib/ipv6.h#L122
+#define GET_PREFIX(PREFIX)						\
+	bpf_htonl(PREFIX <= 0 ? 0 : PREFIX < 32 ? ((1<<PREFIX) - 1) << (32-PREFIX)	\
+			      : 0xFFFFFFFF)
+
+static inline void ipv6_addr_clear_suffix(union v6addr *addr,
+						   int prefix)
+{
+	addr->p1 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p2 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p3 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p4 &= GET_PREFIX(prefix);
+}
+
+static inline int matchIpv6(struct ip_addr *rule_addr, struct ip_addr *target_addr, __u32 prefixLen)
+{
+	if (prefixLen > 128)
+		return UNMATCHED;
+
+	ipv6_addr_clear_suffix(target_addr, prefixLen);
+	if (rule_addr->ip6[0] == target_addr->ip6[0] &&
+		rule_addr->ip6[1] == target_addr->ip6[1] &&
+		rule_addr->ip6[2] == target_addr->ip6[2] &&
+		rule_addr->ip6[3] == target_addr->ip6[3]) {
+        BPF_LOG(DEBUG, KMESH, "match ipv6\n");
+		return MATCHED;
+	}
+
+	return UNMATCHED;
+}
+
+static inline int matchIp(struct ProtobufCBinaryData *addrInfo, __u32 preFixLen, struct bpf_sock_tuple *tuple_info, __u8 type)
+{
+    if (!addrInfo) {
+        BPF_LOG(ERR, AUTH, "addrInfo is null\n");
+        return UNMATCHED;
+    }
+
+    if (!tuple_info) {
+        BPF_LOG(ERR, AUTH, "tuple_info is null\n");
+        return UNMATCHED;
+    }
+    
+	if (addrInfo->len == 4) {
+		if (type & TYPE_SRCIP) {
+			return matchIpv4(convert_ipv4_to_u32(addrInfo), preFixLen, tuple_info->ipv4.saddr);
+		} 
+	} else if (addrInfo->len == 16) {
+		if (type & TYPE_SRCIP) {
+			struct ip_addr rule_addr = {0};
+			struct ip_addr target_addr = {0};
+			int ret = convert_ipv6_to_u32(&rule_addr, addrInfo);
+			if (ret != 0) {
+				BPF_LOG(ERR, AUTH, "failed to convert ipv6 addr to u32 format\n");
+			}
+			IP6_COPY(target_addr.ip6, tuple_info->ipv6.saddr);
+			return matchIpv6(&rule_addr, &target_addr, preFixLen);
+		}
+	}
+	return UNMATCHED;
+}
+
+SEC("xdp_auth")
+int matchSrcIP(struct xdp_md *ctx)
+{
+    struct match_result *res;
+	__u32 key = 0;
+	void *srcPtrs = NULL;
+	void *notSrcPtrs = NULL;
+	__u32 inSrcList = 0;
+	__u32 i;
+    struct bpf_sock_tuple *tuple_info;
+
+    res = bpf_map_lookup_elem(&map_of_t_data, &key);
+    if (!res) {
+        return XDP_DROP;
+    }
+
+    if (!res->match) {
+        return XDP_DROP;
+    }
+
+    Istio__Security__Match *match = kmesh_get_ptr_val(res->match);
+    if (!match) {
+        return XDP_DROP;
+    }
+    tuple_info = kmesh_get_ptr_val(res->tuple_info);
+	if (match->n_source_ips == 0 && match->n_not_source_ips == 0) {
+		res->match_res = MATCHED;
+        goto check_action;
+	}
+
+	// match not_srcIPs
+	if (match->n_not_source_ips != 0) {
+		notSrcPtrs = kmesh_get_ptr_val(match->not_source_ips);
+		if (!notSrcPtrs) {
+			BPF_LOG(ERR, AUTH, "failed to get not_srcips ptr\n");
+			res->match_res = UNMATCHED;
+            goto check_action;
+		}
+
+#pragma unroll   
+		for (i = 0; i < MAX_MEMBER_NUM_PER_POLICY; i++) {
+			if (i >= match-> n_not_source_ips) {
+				break;
+			}
+			Istio__Security__Address *srcAddr = (Istio__Security__Address *)kmesh_get_ptr_val((void *)*((__u64 *)notSrcPtrs + i));
+			if (!srcAddr) {
+				continue;
+			}
+			if (matchIp(&srcAddr->address, srcAddr->length, tuple_info, TYPE_SRCIP) == MATCHED) {
+				res->match_res = UNMATCHED;
+                goto check_action;
+			}  
+		}
+	}
+
+	if (match->n_source_ips != 0) {
+		srcPtrs = kmesh_get_ptr_val(match->source_ips);
+		if (!srcPtrs) {
+			res->match_res = UNMATCHED;
+            goto check_action;
+		}
+
+#pragma unroll   
+		for (i = 0; i < MAX_MEMBER_NUM_PER_POLICY; i++) {
+			if (i >= match->n_source_ips) {
+				break;
+			}
+			Istio__Security__Address *srcAddr = (Istio__Security__Address *)kmesh_get_ptr_val((void *)*((__u64 *)srcPtrs + i));
+			if (!srcAddr) {
+				continue;
+			}
+			if (matchIp(&srcAddr->address, srcAddr->length, tuple_info, TYPE_SRCIP) == MATCHED) {
+				res->match_res = MATCHED;
+                goto check_action;
+			}
+		}
+	}
+    
+    return XDP_PASS;
+
+check_action:
+    return (res->action == AUTH_DENY) ? (res->match_res == MATCHED ? XDP_DROP : XDP_PASS) : (res->match_res == MATCHED ? XDP_PASS : XDP_DROP);
+}
+#endif
 
 static inline int clause_match_check(struct xdp_md *ctx, Istio__Security__Clause *cl, struct bpf_sock_tuple *tuple_info)
 {
