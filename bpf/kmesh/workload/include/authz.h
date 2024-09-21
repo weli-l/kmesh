@@ -26,8 +26,8 @@ struct {
 struct match_result {
     __u32 action;
     __u32 match_res;
-    __u16 dport;
-    struct bpf_sock_tuple *tuple_info;
+    __u8 version;
+    void *tuple_info;
     void *match;
 };
 
@@ -36,11 +36,11 @@ struct match_result {
  * xdp_auth needs to pass during the tail call
  */
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(__u32));
     __uint(value_size, sizeof(struct match_result));
     __uint(max_entries, 1);
-} map_of_t_data SEC(".maps");
+} tailcall_info_map SEC(".maps");
 
 static inline Istio__Security__Authorization *map_lookup_authz(__u32 policyKey)
 {
@@ -56,19 +56,30 @@ SEC("xdp_auth")
 int matchDstPorts(struct xdp_md *ctx)
 {
     struct match_result *res;
-    __u32 key = 0;
+    __u32 key = bpf_get_smp_processor_id();
     __u32 *notPorts = NULL;
     __u32 *ports = NULL;
     __u32 i;
-    __u16 dport; // Destination port
+    __u16 dport = 0; // Destination port
     Istio__Security__Match *match = NULL;
+    struct bpf_sock_tuple *tuple_info;
 
-    res = bpf_map_lookup_elem(&map_of_t_data, &key);
+    res = bpf_map_lookup_elem(&tailcall_info_map, &key);
     if (!res) {
         BPF_LOG(ERR, AUTH, "Failed to retrieve res from map\n");
         return XDP_PASS;
     }
-    dport = res->dport;
+
+    tuple_info = (struct bpf_sock_tuple *)kmesh_get_ptr_val(res->tuple_info);
+    if (!tuple_info) {
+        BPF_LOG(ERR, AUTH, "tuple_info is null\n");
+        return XDP_PASS;
+    }
+    if (res->version == 4) {
+        dport = tuple_info->ipv4.dport;
+    } else {
+        dport = tuple_info->ipv6.dport;
+    }
 
     match = (Istio__Security__Match *)kmesh_get_ptr_val(res->match);
     if (!match) {
@@ -133,10 +144,10 @@ check_action:
 
 static inline int match_check(struct xdp_md *ctx, void *match, struct bpf_sock_tuple *tuple_info)
 {
-    __u32 key = 0;
+    __u32 key = bpf_get_smp_processor_id();
     struct match_result *res;
 
-    res = bpf_map_lookup_elem(&map_of_t_data, &key);
+    res = bpf_map_lookup_elem(&tailcall_info_map, &key);
     if (!res) {
         BPF_LOG(ERR, AUTH, "Failed to lookup map element\n");
         return XDP_DROP;
@@ -145,13 +156,13 @@ static inline int match_check(struct xdp_md *ctx, void *match, struct bpf_sock_t
     res->match_res = UNMATCHED;
     res->match = match;
 
-    int ret = bpf_map_update_elem(&map_of_t_data, &key, res, BPF_ANY);
+    int ret = bpf_map_update_elem(&tailcall_info_map, &key, res, BPF_ANY);
     if (ret < 0) {
         BPF_LOG(ERR, AUTH, "Failed to update map, error: %d\n", ret);
         return XDP_DROP;
     }
 
-    bpf_tail_call(ctx, &map_of_tail_call_prog_for_xdp, TAIL_CALL_PORT_MATCH);
+    bpf_tail_call(ctx, &xdp_tailcall_map, TAIL_CALL_PORT_MATCH);
     return XDP_PASS;
 }
 
@@ -229,7 +240,7 @@ static inline int do_auth(
     Istio__Security__Rule *rule = NULL;
     int matchFlag = 0;
     __u32 i = 0;
-    __u32 key = 0;
+    __u32 key = bpf_get_smp_processor_id();
     struct match_result res;
 
     if (policy->n_rules == 0) {
@@ -246,12 +257,10 @@ static inline int do_auth(
 
     res.action = policy->action;
     res.tuple_info = tuple_info;
-    if (info->iph->version == 4) {
-        res.dport = tuple_info->ipv4.dport;
-    } else {
-        res.dport = tuple_info->ipv6.dport;
-    }
-    bpf_map_update_elem(&map_of_t_data, &key, &res, BPF_ANY);
+    BPF_LOG(ERR, AUTH, " tuple_info %u\n", tuple_info->ipv4.dport);
+
+    res.version = info->iph->version;
+    bpf_map_update_elem(&tailcall_info_map, &key, &res, BPF_ANY);
 
     for (i = 0; i < MAX_MEMBER_NUM_PER_POLICY; i++) {
         if (i >= policy->n_rules) {
