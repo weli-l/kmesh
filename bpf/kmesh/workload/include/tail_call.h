@@ -16,6 +16,7 @@ typedef enum {
     TAIL_CALL_PORT_MATCH,
     TAIL_CALL_SRCIP_MATCH,
     TAIL_CALL_DSTIP_MATCH,
+    TAIL_CALL_AUTH_IN_USER_SPACE,
 } workload_tail_call_index_t;
 
 struct {
@@ -32,7 +33,7 @@ struct {
     __uint(value_size, sizeof(__u32));
     __uint(max_entries, MAP_SIZE_OF_TAIL_CALL_PROG);
     __uint(map_flags, 0);
-} map_of_tail_call_prog_for_xdp SEC(".maps");
+} xdp_tailcall_map SEC(".maps");
 
 static inline void kmesh_workload_tail_call(ctx_buff_t *ctx, const __u32 index)
 {
