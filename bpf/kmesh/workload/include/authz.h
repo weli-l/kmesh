@@ -26,6 +26,7 @@ struct {
 struct match_result {
     __u32 action;
     __u32 match_res;
+    __u16 dport;
     __u8 version;
     void *tuple_info;
     void *match;
@@ -70,17 +71,13 @@ int matchDstPorts(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    tuple_info = (struct bpf_sock_tuple *)kmesh_get_ptr_val(res->tuple_info);
-    if (!tuple_info) {
-        BPF_LOG(ERR, AUTH, "tuple_info is null\n");
-        return XDP_PASS;
-    }
-    if (res->version == 4) {
-        dport = tuple_info->ipv4.dport;
-    } else {
-        dport = tuple_info->ipv6.dport;
-    }
-
+    // tuple_info = (struct bpf_sock_tuple *)kmesh_get_ptr_val(res->tuple_info);
+    // if (!tuple_info) {
+    //     BPF_LOG(ERR, AUTH, "tuple_info is null\n");
+    //     return XDP_PASS;
+    // }
+    dport = res->dport;
+    
     match = (Istio__Security__Match *)kmesh_get_ptr_val(res->match);
     if (!match) {
         BPF_LOG(ERR, AUTH, "match pointer is null\n");
@@ -257,6 +254,11 @@ static inline int do_auth(
 
     res.action = policy->action;
     res.tuple_info = tuple_info;
+    if (info->iph->version == 4) {
+        res.dport = tuple_info->ipv4.dport;
+    } else {
+        res.dport = tuple_info->ipv6.dport;
+    }
     BPF_LOG(ERR, AUTH, " tuple_info %u\n", tuple_info->ipv4.dport);
 
     res.version = info->iph->version;
