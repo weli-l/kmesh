@@ -132,6 +132,7 @@ int matchDstPorts(struct xdp_md *ctx)
     }
 
     res->match_res = UNMATCHED;
+    bpf_tail_call(ctx, &xdp_tailcall_map, TAIL_CALL_AUTH_IN_USER_SPACE);
     return XDP_PASS;
 
 check_action:

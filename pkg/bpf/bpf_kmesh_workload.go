@@ -569,6 +569,13 @@ func (xa *BpfXdpAuthWorkload) LoadXdpAuth() error {
 		return err
 	}
 
+	if err = xa.XdpTailcallMap.Update(
+		uint32(constants.TailCallAuthInUserSpace),
+		uint32(xa.XdpShutdownInUserspace.FD()),
+		ebpf.UpdateAny); err != nil {
+		return err
+	}
+
 	return nil
 }
 
