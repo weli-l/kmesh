@@ -25,8 +25,8 @@ import (
 	"os"
 	"path"
 	"strings"
+	"syscall"
 
-	nd "istio.io/istio/cni/pkg/nodeagent"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/pkg/log"
 	corev1 "k8s.io/api/core/v1"
@@ -91,6 +91,13 @@ func isProcess(entry fs.DirEntry) bool {
 	return true
 }
 
+func GetInode(fi fs.FileInfo) (uint64, error) {
+	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return stat.Ino, nil
+	}
+	return 0, fmt.Errorf("unable to get inode")
+}
+
 // copied from https://github.com/istio/istio/blob/master/cni/pkg/nodeagent/podcgroupns.go
 func processEntry(proc fs.FS, netnsObserved sets.Set[uint64], filter types.UID, entry fs.DirEntry) (string, error) {
 	if !isProcess(entry) {
@@ -103,7 +110,7 @@ func processEntry(proc fs.FS, netnsObserved sets.Set[uint64], filter types.UID, 
 		return "", err
 	}
 
-	inode, err := nd.GetInode(fi)
+	inode, err := GetInode(fi)
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +131,7 @@ func processEntry(proc fs.FS, netnsObserved sets.Set[uint64], filter types.UID, 
 		return "", nil
 	}
 
-	uid, _, err := nd.GetPodUIDAndContainerID(cgroupData)
+	uid, _, err := GetPodUIDAndContainerID(cgroupData)
 	if err != nil {
 		return "", err
 	}
