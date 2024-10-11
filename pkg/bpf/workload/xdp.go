@@ -106,6 +106,20 @@ func (xa *BpfXdpAuthWorkload) LoadXdpAuth() error {
 	}
 
 	if err = xa.XdpTailcallMap.Update(
+		uint32(constants.TailCallSrcIPMatch),
+		uint32(xa.MatchSrcIPs.FD()),
+		ebpf.UpdateAny); err != nil {
+		return err
+	}
+
+	if err = xa.XdpTailcallMap.Update(
+		uint32(constants.TailCallDstIPMatch),
+		uint32(xa.MatchDstIPs.FD()),
+		ebpf.UpdateAny); err != nil {
+		return err
+	}
+
+	if err = xa.XdpTailcallMap.Update(
 		uint32(constants.TailCallAuthInUserSpace),
 		uint32(xa.XdpShutdownInUserspace.FD()),
 		ebpf.UpdateAny); err != nil {
