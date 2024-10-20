@@ -271,9 +271,19 @@ int policy_check(struct xdp_md *ctx)
 
     policies = res->policies;
     if (!policies) {
-        return AUTH_ALLOW;
+        return XDP_PASS;
     }
-    policyId = policies->policyIds[res->policy_index];
+
+    if (res->policy_index < 0 || res->policy_index >= MAX_MEMBER_NUM_PER_POLICY) {
+        BPF_LOG(ERR, AUTH, "Policy index out of bounds");
+        return XDP_PASS;
+    }
+
+    // Safely access policyId and check if the policy exists
+    if (bpf_probe_read_kernel(&policyId, sizeof(policyId), (void *)(policies->policyIds + res->policy_index)) != 0) {
+        BPF_LOG(ERR, AUTH, "Failed to read policyId");
+        return XDP_DROP;
+    }
     policy = map_lookup_authz(policyId);
     if (!policy) {
         // if no policy matches in xdp, thrown it to user auth
@@ -282,7 +292,7 @@ int policy_check(struct xdp_md *ctx)
         rulesPtr = kmesh_get_ptr_val(policy->rules);
         if (!rulesPtr) {
             BPF_LOG(ERR, AUTH, "failed to get rules from policy %s\n", kmesh_get_ptr_val(policy->name));
-            return AUTH_DENY;
+            return XDP_DROP;
         }
         res->rulesPtr = rulesPtr;
         ret = bpf_map_update_elem(&tailcall_info_map, &tuple_key, res, BPF_ANY);
@@ -302,6 +312,7 @@ int rule_check(struct xdp_md *ctx)
     struct bpf_sock_tuple tuple_key = {0};
     struct xdp_info info = {0};
     void *rulesPtr;
+    __u64 rule_addr;
     void *rule;
     int ret;
     int i;
@@ -315,14 +326,30 @@ int rule_check(struct xdp_md *ctx)
     if (!res) {
         BPF_LOG(ERR, AUTH, "Failed to retrieve res from map");
         return XDP_PASS;
-    }
-    
-    rulesPtr = res->rulesPtr;
+    }   
     for (i = 0; i < MAX_MEMBER_NUM_PER_POLICY; i++) {
+        if (!res) {
+            BPF_LOG(ERR, AUTH, "Failed to retrieve res from map");
+            return XDP_PASS;
+        }
+        rulesPtr = res->rulesPtr;
+        if (!rulesPtr) {
+            return XDP_PASS;
+        }
         if (i >= res->n_rules) {
             break;
         }
-        rule = (Istio__Security__Rule *)kmesh_get_ptr_val((void *)*((__u64 *)rulesPtr + i));
+        if (bpf_probe_read_kernel(&rule_addr, sizeof(rule_addr), &rulesPtr[i]) != 0) {
+            BPF_LOG(ERR, AUTH, "Failed to read rule address at index %d", i);
+            continue;
+        }
+
+        // 调用 kmesh_get_ptr_val 获取实际的规则内容
+        rule = (Istio__Security__Rule *)kmesh_get_ptr_val((void *)rule_addr);
+        if (!rule) {
+            continue;
+        }
+        //rule = (Istio__Security__Rule *)kmesh_get_ptr_val((void *)*((__u64 *)rulesPtr + i));
         if (!rule) {
             continue;
         }
