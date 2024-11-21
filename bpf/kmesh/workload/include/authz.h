@@ -14,6 +14,9 @@
 #define AUTH_DENY  1
 #define UNMATCHED  0
 #define MATCHED    1
+#define UNSUPPORTED 2
+#define TYPE_SRCIP   (1)
+#define TYPE_DSTIP   (1 << 1)
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -181,13 +184,297 @@ static int match_dst_ports(Istio__Security__Match *match, struct xdp_info *info,
     return UNMATCHED;
 }
 
+// static inline __u32 convert_ipv4_to_u32(const struct ProtobufCBinaryData *ipv4_data)
+// {
+//     __u32 result = 0;
+
+//     if (!ipv4_data || ipv4_data->len != 4)
+//         return 0;
+
+//     unsigned char data[4];
+//     if (bpf_probe_read_kernel(&data, sizeof(data), ipv4_data->data) != 0)
+//         return 0;
+
+//     result = (data[0] << 24) |
+//              (data[1] << 16) |
+//              (data[2] << 8)  |
+//              (data[3] << 0);
+
+//     return result;
+// }
+
+// static inline __u32 convert_ipv4_to_u32(const struct ProtobufCBinaryData *ipv4_data)
+// {
+//     __u32 result = 0;
+
+//     if (!ipv4_data) {
+//         BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: ipv4_data is NULL\n");
+//         return 0;
+//     }
+    
+//     if (ipv4_data->len != 4) {
+//         BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: Invalid length: %u\n", ipv4_data->len);
+//         return 0;
+//     }
+
+//     unsigned char data[4];
+//     if (bpf_probe_read_kernel(&data, sizeof(data), ipv4_data->data) != 0) {
+//         BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: Failed to read data from ipv4_data\n");
+//         return 0;
+//     }
+
+//     // 使用 ip2str 打印 data 数组的 IP 地址
+//     //BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: ipv4_data->data = %u\n", ip2str(&data[0], 1));
+
+//     BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: Read IP: %s\n", ip2str(&ipv4_data->data, 1));
+
+//     result = (data[0] << 24) |
+//              (data[1] << 16) |
+//              (data[2] << 8)  |
+//              (data[3] << 0);
+
+//     // 使用 ip2str 打印转换后的结果
+//     BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: Converted result: %s\n", ip2str(&result, 1));
+
+//     return result;
+// }
+
+
+static inline __u32 convert_ipv4_to_u32(const struct ProtobufCBinaryData *ipv4_data)
+{
+	if (!ipv4_data->data || ipv4_data->len != 4) {
+		return 0;
+	}
+
+    unsigned char *data = (unsigned char *)KMESH_GET_PTR_VAL(ipv4_data->data, unsigned char);
+	if (!data) {
+        BPF_LOG(INFO, AUTH, "convert_ipv4_to_u32: Failed to read data from ipv4_data\n");
+		return 0;
+	}
+
+	return (data[3] << 24) |
+		   (data[2] << 16) |
+		   (data[1] << 8)  |
+		   (data[0] << 0);
+}
+
+static inline __u32 convert_ipv6_to_u32(struct ip_addr *rule_addr, const struct ProtobufCBinaryData *ipv6_data)
+{
+    if (!rule_addr ||!ipv6_data)
+        return 1;
+	if (!ipv6_data->data || ipv6_data->len != 16) {
+		return 1;
+	}
+
+	unsigned char *v6addr = (unsigned char *)KMESH_GET_PTR_VAL(ipv6_data->data, unsigned char*);
+	if (!v6addr) {
+		return 1;
+	}
+
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			rule_addr->ip6[i] |= (v6addr[i * 4 + j] << (i * 8));
+		}
+	}
+
+	return 0;
+}
+
+// reference cilium https://github.com/cilium/cilium/blob/main/bpf/lib/ipv6.h#L122
+#define GET_PREFIX(PREFIX)						\
+	bpf_htonl(PREFIX <= 0 ? 0 : PREFIX < 32 ? ((1<<PREFIX) - 1) << (32-PREFIX)	\
+			      : 0xFFFFFFFF)
+
+static inline void ipv6_addr_clear_suffix(union v6addr *addr,
+						   int prefix)
+{
+	addr->p1 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p2 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p3 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p4 &= GET_PREFIX(prefix);
+}
+
+static inline int matchIpv4(__u32 ruleIp, __u32 preFixLen, __be32 targetIP)
+{
+	__u32 mask = 0;
+
+	if (preFixLen > 32) {
+		return UNMATCHED;
+	}
+	mask = 0xFFFFFFFF << (32 - preFixLen);
+	if ((ruleIp & mask) == (targetIP & mask)) {
+		return MATCHED; 
+	}
+	return 0;
+}
+
+static inline int matchIpv6(struct ip_addr *rule_addr, struct ip_addr *target_addr, __u32 prefixLen)
+{
+	if (prefixLen > 128)
+		return UNMATCHED;
+
+	ipv6_addr_clear_suffix(target_addr, prefixLen);
+	if (rule_addr->ip6[0] == target_addr->ip6[0] &&
+		rule_addr->ip6[1] == target_addr->ip6[1] &&
+		rule_addr->ip6[2] == target_addr->ip6[2] &&
+		rule_addr->ip6[3] == target_addr->ip6[3]) {
+        BPF_LOG(DEBUG, KMESH, "match ipv6\n");
+		return MATCHED;
+	}
+
+	return UNMATCHED;
+}
+
+// static inline int matchIp(struct ProtobufCBinaryData *addrInfo, __u32 preFixLen, struct bpf_sock_tuple *tuple_info, __u8 type)
+// {
+// 	if (addrInfo->len == 4) {
+// 		if (type & TYPE_SRCIP) {
+// 			return matchIpv4(convert_ipv4_to_u32(addrInfo), preFixLen, tuple_info->ipv4.saddr);
+// 		} 
+// 	} else if (addrInfo->len == 16) {
+// 		if (type & TYPE_SRCIP) {
+// 			struct ip_addr rule_addr = {0};
+// 			struct ip_addr target_addr = {0};
+// 			int ret = convert_ipv6_to_u32(&rule_addr, addrInfo);
+// 			if (ret != 0) {
+// 				BPF_LOG(ERR, AUTH, "failed to convert ipv6 addr to u32 format\n");
+// 			}
+// 			IP6_COPY(target_addr.ip6, tuple_info->ipv6.saddr);
+// 			return matchIpv6(&rule_addr, &target_addr, preFixLen);
+// 		}
+// 	}
+// 	return UNMATCHED;
+// }
+static inline int matchIp(struct ProtobufCBinaryData *addrInfo, __u32 preFixLen, struct bpf_sock_tuple *tuple_info, __u8 type)
+{
+    BPF_LOG(ERR, AUTH, "matchIp\n");
+    if (!addrInfo || addrInfo->len == 0) {
+        BPF_LOG(ERR, AUTH, "addrInfo is NULL or length is 0\n");
+        return UNMATCHED;
+    }
+
+    // IPv4 匹配逻辑
+    if (addrInfo->len == 4) {
+        __u32 rule_ip = convert_ipv4_to_u32(addrInfo);
+
+        if (type & TYPE_SRCIP) {
+            BPF_LOG(INFO, AUTH, "IPv4 match: Rule IP: %x, Prefix Length: %u, Target IP: %x\n",
+                    rule_ip, preFixLen, tuple_info->ipv4.saddr);
+            return matchIpv4(rule_ip, preFixLen, tuple_info->ipv4.saddr);
+        }
+    } 
+    // IPv6 匹配逻辑
+    else if (addrInfo->len == 16) {
+        if (type & TYPE_SRCIP) {
+            struct ip_addr rule_addr = {0};
+            struct ip_addr target_addr = {0};
+
+            int ret = convert_ipv6_to_u32(&rule_addr, addrInfo);
+            if (ret != 0) {
+                BPF_LOG(ERR, AUTH, "Failed to convert IPv6 address to u32 format\n");
+                return UNMATCHED;
+            }
+
+            IP6_COPY(target_addr.ip6, tuple_info->ipv6.saddr);
+            return matchIpv6(&rule_addr, &target_addr, preFixLen);
+        }
+    } else {
+        BPF_LOG(ERR, AUTH, "Unsupported address length: %u\n", addrInfo->len);
+    }
+
+    return UNMATCHED;
+}
+
+static inline int match_IPs(Istio__Security__Match *match, struct bpf_sock_tuple *tuple_info)
+{
+    BPF_LOG(INFO, AUTH, "match_IPs match_IPs++++++");
+	void *srcPtrs = NULL;
+	void *notSrcPtrs = NULL;
+    void *srcAddr = NULL;
+    void *notSrcAddr = NULL;
+    Istio__Security__Address *src = NULL;
+    Istio__Security__Address *notSrc = NULL;
+	__u32 inSrcList = 0;
+	__u32 i;
+
+	if (match->n_source_ips == 0 && match->n_not_source_ips == 0) {
+		BPF_LOG(DEBUG, AUTH, "no srcip configured, matching by default");
+		return MATCHED;
+	}
+
+	// match not_srcIPs
+	if (match->n_not_source_ips != 0) {
+		notSrcPtrs = KMESH_GET_PTR_VAL(match->not_source_ips, void *);
+		if (!notSrcPtrs) {
+			BPF_LOG(ERR, AUTH, "failed to retrieve not_srcips pointer\n");
+			return UNMATCHED;
+		}
+
+#pragma unroll   
+		for (i = 0; i < MAX_MEMBER_NUM_PER_POLICY; i++) {
+			if (i >= match-> n_not_source_ips) {
+				break;
+			}
+
+			if (bpf_probe_read_kernel(&notSrcAddr, sizeof(notSrcAddr), &srcPtrs[i]) != 0) {
+                BPF_LOG(ERR, AUTH, "failed to read notSrcAddr address at index %d", i);
+                continue;
+            }
+
+			notSrc = (Istio__Security__Address *)KMESH_GET_PTR_VAL((void *)notSrcAddr, Istio__Security__Address);
+			if (!notSrc) {
+				continue;
+			}
+			// todo: ProtobufCBinaryData address是否需要使用mesh_get_ptr_val
+			// in n_src_ips means in blacklist, return unmatch
+			if (matchIp(&notSrc->address, notSrc->length, tuple_info, TYPE_SRCIP) == MATCHED) {
+				return UNMATCHED;
+			}  
+		}
+	}
+
+	if (match->n_source_ips != 0) {
+		srcPtrs = KMESH_GET_PTR_VAL(match->source_ips, void *);
+		if (!srcPtrs) {
+			BPF_LOG(ERR, AUTH, "failed to get srcips ptr\n");
+			return UNMATCHED;
+		}
+
+#pragma unroll   
+		for (i = 0; i < MAX_MEMBER_NUM_PER_POLICY; i++) {
+			if (i >= match->n_source_ips) {
+				break;
+			}
+
+            if (bpf_probe_read_kernel(&srcAddr, sizeof(srcAddr), &srcPtrs[i]) != 0) {
+                BPF_LOG(ERR, AUTH, "failed to read src address at index %d", i);
+                continue;
+            }
+
+			src = (Istio__Security__Address *)KMESH_GET_PTR_VAL((void *)srcAddr, Istio__Security__Address);
+			if (!src) {
+				continue;
+			}
+			// todo: ProtobufCBinaryData address是否需要使用mesh_get_ptr_val
+			if (matchIp(&src->address, src->length, tuple_info, TYPE_SRCIP) == MATCHED) {
+				return MATCHED;
+			}
+		}
+	}
+	BPF_LOG(DEBUG, AUTH, "no matching srcip found, unmatched");
+	return UNMATCHED;
+}
+
 static int match_check(Istio__Security__Match *match, struct xdp_info *info, struct bpf_sock_tuple *tuple_info)
 {
     __u32 matchResult;
 
     // if multiple types are set, they are AND-ed, all matched is a match
     // todo: add other match types
-    matchResult = match_dst_ports(match, info, tuple_info);
+    matchResult = match_dst_ports(match, info, tuple_info) && match_IPs(match, tuple_info);
     return matchResult;
 }
 
@@ -295,6 +582,7 @@ int policy_check(struct xdp_md *ctx)
         BPF_LOG(INFO, AUTH, "no more policy, throw it to user auth");
         goto auth_in_user_space;
     } else {
+        BPF_LOG(INFO, AUTH, "has policy++++++");
         rulesPtr = KMESH_GET_PTR_VAL(policy->rules, void *);
         if (!rulesPtr) {
             BPF_LOG(ERR, AUTH, "failed to get rules from policies\n");
