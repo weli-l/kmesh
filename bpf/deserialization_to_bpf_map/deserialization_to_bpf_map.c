@@ -417,6 +417,11 @@ static int get_msg_field_size(const ProtobufCFieldDescriptor *field)
     return ((ProtobufCMessageDescriptor *)(field->descriptor))->sizeof_message;
 }
 
+static int get_binary_field_size(const ProtobufCFieldDescriptor *field)
+{
+    return MAP_VAL_BINARY_SIZR;
+}
+
 static int get_field_size(struct op_context *ctx, const ProtobufCFieldDescriptor *field)
 {
     char *value = NULL;
@@ -428,6 +433,10 @@ static int get_field_size(struct op_context *ctx, const ProtobufCFieldDescriptor
         value = *(char **)((char *)ctx->value + field->offset);
         return get_string_field_size(field, value);
     }
+    
+    if (field->type == PROTOBUF_C_TYPE_BYTES) {
+        return get_binary_field_size(field);
+    }
     return -1;
 }
 
@@ -436,7 +445,7 @@ static int field_handle(struct op_context *ctx, const ProtobufCFieldDescriptor *
     int ret;
     unsigned int key;
 
-    if (field->type != PROTOBUF_C_TYPE_MESSAGE && field->type != PROTOBUF_C_TYPE_STRING)
+    if (field->type != PROTOBUF_C_TYPE_MESSAGE && field->type != PROTOBUF_C_TYPE_STRING && field->type != PROTOBUF_C_TYPE_BYTES)
         return 0;
 
     key = alloc_outer_key(ctx, get_field_size(ctx, field));
