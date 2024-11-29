@@ -121,4 +121,9 @@ func SetAuthzPerKmeshDaemon(cli kube.CLIClient, podName, info string) {
 		log.Errorf("Error: received status code %d", resp.StatusCode)
 		return
 	}
+	if info == "true" {
+		log.Infof("Authorization offload successfully enabled for Kmesh daemon pod %s", podName)
+	} else {
+		log.Infof("Authorization offload successfully disabled for Kmesh daemon pod %s", podName)
+	}
 }
